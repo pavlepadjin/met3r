@@ -120,6 +120,70 @@ class MEt3R(Module):
         )
 
         self.rasterizer = PointsRasterizer(cameras=None, raster_settings=raster_settings)
+        
+        
+    def _compute_canonical_point_map(self, images: Float[Tensor, "b 2 c h w"], return_ptmps: bool=False) -> Float[Tensor, "b h w 3"]:
+        # NOTE: Apply DUST3R to get point maps and confidence scores
+        view1 = {"img": images[:, 0, ...], "instance": [""]}
+        view2 = {"img": images[:, 1, ...], "instance": [""]}
+        pred1, pred2 = self.dust3r(view1, view2)
+
+        ptmps = torch.stack([pred1["pts3d"], pred2["pts3d_in_other_view"]], dim=1).detach()
+        conf = torch.stack([pred1["conf"], pred2["conf"]], dim=1).detach()
+
+        # NOTE: Get canonical point map using the confidences
+        confs11 = conf.unsqueeze(-1) - 0.999
+        canon = (confs11 * ptmps).sum(1) / confs11.sum(1)
+        outputs = [canon]
+        if return_ptmps:
+            outputs.append(ptmps)
+        return (*outputs, )
+    
+
+    @staticmethod
+    def depth_to_pointmap(depth_map, K, R, t):
+        """
+        Convert a depth map to a 3D point map using camera intrinsics and extrinsics.
+        
+        Args:
+            depth_map (torch.Tensor): Depth map of shape (H, W).
+            K (torch.Tensor): Camera intrinsic matrix of shape (3, 3).
+            R (torch.Tensor): Rotation matrix of shape (3, 3).
+            t (torch.Tensor): Translation vector of shape (3, 1).
+
+        Returns:
+            torch.Tensor: 3D point map of shape (H, W, 3) in world coordinates.
+        """
+        H, W = depth_map.shape[-2:]
+        
+        R, t = torch.tensor(R).to(dtype=torch.float32, device=depth_map.device), torch.tensor(t).to(dtype=torch.float32, device=depth_map.device)
+
+        # Create mesh grid of pixel coordinates
+        y, x = torch.meshgrid(torch.arange(H, device=depth_map.device), 
+                            torch.arange(W, device=depth_map.device), indexing='ij')
+
+        # Convert pixel coordinates to normalized camera coordinates
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+
+        X_c = (x.float() - cx) * depth_map / fx
+        Y_c = (y.float() - cy) * depth_map / fy
+        Z_c = depth_map
+
+        # Stack to get camera coordinates (H, W, 3)
+        points_camera = torch.stack((X_c, Y_c, Z_c), dim=-1)  # Shape: (H, W, 3)
+
+        # Reshape for matrix multiplication (3, H*W)
+        points_camera_reshaped = points_camera.reshape(-1, 3).T  # (3, H*W)
+
+        # Convert to world coordinates: P_w = R * P_c + t
+        points_world = R @ points_camera_reshaped + t.unsqueeze(-1)  # (3, H*W)
+
+        # Reshape back to (H, W, 3)
+        points_world = points_world.T.reshape(H, W, 3)
+
+        return points_world.unsqueeze(0)
+
     def render(
         self, 
         point_clouds: Pointclouds, 
@@ -155,13 +219,18 @@ class MEt3R(Module):
         images = images.permute(0, 2, 3, 1)
 
         return images, fragments.zbuf
+    
+
 
     def forward(
         self, 
         images: Float[Tensor, "b 2 c h w"], 
         return_overlap_mask: bool=False, 
         return_score_map: bool=False, 
-        return_projections: bool=False
+        return_projections: bool=False,
+        depth_map: Float[Tensor, "b h w"] | None = None,
+        K: Float[Tensor, "b 3 3"] | None = None,
+        pose: Float[Tensor, "b 4 4"] | None = None
     ) -> Tuple[
             float, 
             Bool[Tensor, "b h w"] | None, 
@@ -186,6 +255,9 @@ class MEt3R(Module):
         
         *_, h, w = images.shape
         
+        if K is not None or pose is not None or depth_map is not None:
+            assert K is not None and pose is not None and depth_map is not None, "K, pose, and depth_map must be provided together"
+        
         # Set rasterization settings on the fly based on input resolution
         if self.img_size is None:
             raster_settings = PointsRasterizationSettings(
@@ -195,24 +267,18 @@ class MEt3R(Module):
                     bin_size=0
                 )
             self.rasterizer = PointsRasterizer(cameras=None, raster_settings=raster_settings)
-
-        # K=2 since we only compare an image pairs
-        # NOTE: Apply DUST3R to get point maps and confidence scores
-        view1 = {"img": images[:, 0, ...], "instance": [""]}
-        view2 = {"img": images[:, 1, ...], "instance": [""]}
-        pred1, pred2 = self.dust3r(view1, view2)
-
-        ptmps = torch.stack([pred1["pts3d"], pred2["pts3d_in_other_view"]], dim=1).detach()
-        conf = torch.stack([pred1["conf"], pred2["conf"]], dim=1).detach()
-
-        # NOTE: Get canonical point map using the confidences
-        confs11 = conf.unsqueeze(-1) - 0.999
-        canon = (confs11 * ptmps).sum(1) / confs11.sum(1)
+        
+        if depth_map is None:
+            canon, ptmps = self._compute_canonical_point_map(images, return_ptmps=True)
+        else:
+            canon = self.depth_to_pointmap(depth_map, K, pose[:3, :3], pose[:3, 3]) # (B, H, W, 3)
+            
+            _, ptmps = self._compute_canonical_point_map(images, return_ptmps=True)
         
         # Define principal point
         pp = torch.tensor([w /2 , h / 2], device=canon.device)
         
-        
+            
         # NOTE: Estimating fx and fy for a given canonical point map
         B, H, W, THREE = canon.shape
         assert THREE == 3
@@ -236,6 +302,14 @@ class MEt3R(Module):
         focal[..., 1] = 1 + focal[..., 1]/h
         focal = repeat(focal, "b c -> (b k) c", k=2)
         
+        if K is not None:
+            focal = torch.tensor([
+                [K[0, 0], K[1, 1]],
+                [K[0, 0], K[1, 1]]
+            ]).to(dtype=torch.float32, device=canon.device)
+            focal[..., 0] = 1 + focal[..., 0] / w
+            focal[..., 1] = 1 + focal[..., 1] / h
+        
         # NOTE: Getting high-resolution features from FeatUp
         b, k, *_ = images.shape
         images = rearrange(images, "b k c h w -> (b k) c h w")
@@ -245,13 +319,6 @@ class MEt3R(Module):
         if self.use_featup:
             # Some feature backbone may result in a different resolution feature maps than the inputs
             hr_feat = self.upsampler(norm(images))
-            hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode="bilinear")
-            hr_feat = rearrange(hr_feat, "... c h w -> ... (h w) c")
-            
-        elif self.use_mast3r_dust3r and self.use_mast3r_features:
-            # NOTE: Only for Ablation (Not to be used for measuring consistency)
-            hr_feat = torch.stack([pred1["desc"], pred2["desc"]], dim=1)
-            hr_feat = rearrange(hr_feat, "b k h w c -> (b k) c h w")
             hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode="bilinear")
             hr_feat = rearrange(hr_feat, "... c h w -> ... (h w) c")
         
