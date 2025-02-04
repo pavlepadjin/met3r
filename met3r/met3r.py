@@ -195,6 +195,31 @@ class MEt3R(Module):
         points_world = points_world.T.reshape(H, W, 3)
 
         return points_world.unsqueeze(0)
+    
+    
+    def _canonical_point_map_from_depth(self, train_depth, ood_depth, K, train_pose, ood_pose):
+        h, w = train_depth.shape[-2:]
+        Rt = train_pose[:3, :3]
+        tt = train_pose[:3, 3]
+        Rood = ood_pose[:3, :3]
+        tood = ood_pose[:3, 3]
+        
+        # invert poses from wc to cw
+        Rt, tt = self.invert_pose(Rt, tt)
+        Rood, tood = self.invert_pose(Rood, tood)
+        
+        Rt_rel = Rood.T @ Rt
+        tt_rel = Rood.T @ (tt - tood)
+        
+        
+        # use the relative pose to get the point map for the ood image
+        ptmps = torch.zeros(train_depth.shape[0], 2, h, w, 3).to(train_depth.device)
+        ptmps[:, 1, ...] = self.depth_to_pointmap(train_depth, K, Rt_rel, tt_rel)
+        ptmps[:, 0, ...] = self.depth_to_pointmap(ood_depth, K, torch.eye(3), torch.zeros(3))
+        
+        canon = ptmps[:,0,...]      
+        
+        return canon, ptmps
 
     def render(
         self, 
@@ -286,68 +311,9 @@ class MEt3R(Module):
         if train_depth is None:
             canon, ptmps = self._compute_canonical_point_map(images, return_ptmps=True)
         else:
-            #train_pose[1, 3] = abs(train_pose[1, 3]) # make the y coordinate positive
-            #ood_pose[1, 3] = abs(ood_pose[1, 3])
 
-            Rt = train_pose[:3, :3]
-            tt = train_pose[:3, 3]
-            Rood = ood_pose[:3, :3]
-            tood = ood_pose[:3, 3]
-            
-            # invert poses from wc to cw
-            Rt, tt = self.invert_pose(Rt, tt)
-            Rood, tood = self.invert_pose(Rood, tood)
-           
-            Rt_rel = Rood.T @ Rt
-            tt_rel = Rood.T @ (tt - tood)
-           
-           
-            # use the relative pose to get the point map for the ood image
-            ptmps = torch.zeros(images.shape[0], 2, h, w, 3).to(images.device)
-            ptmps[:, 1, ...] = self.depth_to_pointmap(train_depth, K, Rt_rel, tt_rel)
-            ptmps[:, 0, ...] = self.depth_to_pointmap(ood_depth, K, torch.eye(3), torch.zeros(3))
-            
-            
-            #ptmps = torch.zeros(images.shape[0], 2, h, w, 3).to(images.device)
-            #ptmps[:, 1, ...] = self.depth_to_pointmap(train_depth, K, train_pose[:3, :3], train_pose[:3, 3])
-            #ptmps[:, 0, ...] = self.depth_to_pointmap(ood_depth, K, ood_pose[:3, :3], ood_pose[:3, 3])            
-            
-            # canon is average of the two point maps
-            canon = ptmps[:,0,...]            
-            canon_old, ptmps_old = self._compute_canonical_point_map(images, return_ptmps=True) # (B, 2, H, W, 3)
+           canon, ptmps = self._canonical_point_map_from_depth(train_depth, ood_depth, K, train_pose, ood_pose)
 
-            plot_imgs = True
-            if plot_imgs:
-                from PIL import Image
-                import numpy as np  
-                # save the old and new point maps as RGB images
-                import matplotlib.pyplot as plt
-                
-                def plot_xyz_channels(data, filename):
-                    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-                    im1 = ax1.imshow(data[..., 0].cpu().numpy())
-                    im2 = ax2.imshow(data[..., 1].cpu().numpy())
-                    im3 = ax3.imshow(data[..., 2].cpu().numpy())
-                    ax1.set_title('X')
-                    ax2.set_title('Y') 
-                    ax3.set_title('Z')
-                    plt.colorbar(im1, ax=ax1)
-                    plt.colorbar(im2, ax=ax2)
-                    plt.colorbar(im3, ax=ax3)
-                    plt.savefig(filename)
-                    plt.close()
-
-                plot_xyz_channels(canon_old[0], "/home/ubuntu/captures/canon_old.jpg")
-                plot_xyz_channels(canon[0], "/home/ubuntu/captures/canon.jpg")
-                plot_xyz_channels(ptmps_old[0,0], "/home/ubuntu/captures/ptmps_old_0.jpg")
-                plot_xyz_channels(ptmps[0,0], "/home/ubuntu/captures/ptmps_0.jpg")
-                plot_xyz_channels(ptmps_old[0,1], "/home/ubuntu/captures/ptmps_old_1.jpg")
-                plot_xyz_channels(ptmps[0,1], "/home/ubuntu/captures/ptmps_1.jpg")
-                
-        
-            #canon = canon_old
-            #ptmps = ptmps_old
-        
         # Define principal point
         pp = torch.tensor([w /2 , h / 2], device=canon.device)
         
