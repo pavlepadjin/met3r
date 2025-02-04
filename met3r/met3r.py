@@ -211,11 +211,10 @@ class MEt3R(Module):
         Rt_rel = Rood.T @ Rt
         tt_rel = Rood.T @ (tt - tood)
         
-        
         # use the relative pose to get the point map for the ood image
         ptmps = torch.zeros(train_depth.shape[0], 2, h, w, 3).to(train_depth.device)
-        ptmps[:, 1, ...] = self.depth_to_pointmap(train_depth, K, Rt_rel, tt_rel)
-        ptmps[:, 0, ...] = self.depth_to_pointmap(ood_depth, K, torch.eye(3), torch.zeros(3))
+        ptmps[:, 0, ...] = self.depth_to_pointmap(train_depth, K, Rt_rel, tt_rel)
+        ptmps[:, 1, ...] = self.depth_to_pointmap(ood_depth, K, torch.eye(3), torch.zeros(3))
         
         canon = ptmps[:,0,...]      
         
@@ -262,7 +261,8 @@ class MEt3R(Module):
     # !!!!!!! Generalize this later
     def forward(
         self, 
-        images: Float[Tensor, "b 2 c h w"], 
+        train_rgb: Float[Tensor, "b 3 h w"],
+        ood_rgb: Float[Tensor, "b 3 h w"],
         return_overlap_mask: bool=False, 
         return_score_map: bool=False, 
         return_projections: bool=False,
@@ -293,6 +293,9 @@ class MEt3R(Module):
         """
         
         
+        images = torch.zeros(1, 2, *train_rgb.shape).to(train_rgb.device)
+        images[0,1] = ood_rgb
+        images[0,0] = train_rgb
         *_, h, w = images.shape
         
         if K is not None or train_pose is not None or train_depth is not None:
