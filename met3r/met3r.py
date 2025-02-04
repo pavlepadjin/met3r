@@ -1,4 +1,3 @@
-
 # import os
 # os.environ['TORCH_HOME'] = '/BS/grl-masim-data/work/torch_models'
 
@@ -139,24 +138,32 @@ class MEt3R(Module):
             outputs.append(ptmps)
         return (*outputs, )
     
+    @staticmethod
+    def invert_pose(R, t):
+        R_inv = R.T
+        t_inv = -R_inv @ t
+        return R_inv, t_inv
 
     @staticmethod
     def depth_to_pointmap(depth_map, K, R, t):
         """
         Convert a depth map to a 3D point map using camera intrinsics and extrinsics.
+        Assumes R and t are in world-to-camera form (P_camera = R*P_world + t).
+        Will convert to camera-to-world internally.
         
         Args:
             depth_map (torch.Tensor): Depth map of shape (H, W).
             K (torch.Tensor): Camera intrinsic matrix of shape (3, 3).
-            R (torch.Tensor): Rotation matrix of shape (3, 3).
-            t (torch.Tensor): Translation vector of shape (3, 1).
+            R (torch.Tensor): World-to-camera rotation matrix of shape (3, 3).
+            t (torch.Tensor): World-to-camera translation vector of shape (3, 1).
 
         Returns:
             torch.Tensor: 3D point map of shape (H, W, 3) in world coordinates.
         """
         H, W = depth_map.shape[-2:]
         
-        R, t = torch.tensor(R).to(dtype=torch.float32, device=depth_map.device), torch.tensor(t).to(dtype=torch.float32, device=depth_map.device)
+        R = torch.tensor(R, dtype=torch.float32, device=depth_map.device)
+        t = torch.tensor(t, dtype=torch.float32, device=depth_map.device)
 
         # Create mesh grid of pixel coordinates
         y, x = torch.meshgrid(torch.arange(H, device=depth_map.device), 
@@ -176,7 +183,12 @@ class MEt3R(Module):
         # Reshape for matrix multiplication (3, H*W)
         points_camera_reshaped = points_camera.reshape(-1, 3).T  # (3, H*W)
 
-        # Convert to world coordinates: P_w = R * P_c + t
+        # Convert world-to-camera transform to camera-to-world transform
+        # If P_camera = R * P_world + t
+        # Then P_world = R^T * (P_camera - t)
+        #R, t = MEt3R.invert_pose(R, t)
+
+        # Convert to world coordinates using camera-to-world transform
         points_world = R @ points_camera_reshaped + t.unsqueeze(-1)  # (3, H*W)
 
         # Reshape back to (H, W, 3)
@@ -221,16 +233,19 @@ class MEt3R(Module):
         return images, fragments.zbuf
     
 
-
+    # NOTE: Assuming that input[0] is ood and input[1] is train
+    # !!!!!!! Generalize this later
     def forward(
         self, 
         images: Float[Tensor, "b 2 c h w"], 
         return_overlap_mask: bool=False, 
         return_score_map: bool=False, 
         return_projections: bool=False,
-        depth_map: Float[Tensor, "b h w"] | None = None,
+        train_depth: Float[Tensor, "b h w"] | None = None,
+        ood_depth: Float[Tensor, "b h w"] | None = None,
         K: Float[Tensor, "b 3 3"] | None = None,
-        pose: Float[Tensor, "b 4 4"] | None = None
+        train_pose: Float[Tensor, "b 4 4"] | None = None,
+        ood_pose: Float[Tensor, "b 4 4"] | None = None
     ) -> Tuple[
             float, 
             Bool[Tensor, "b h w"] | None, 
@@ -255,8 +270,8 @@ class MEt3R(Module):
         
         *_, h, w = images.shape
         
-        if K is not None or pose is not None or depth_map is not None:
-            assert K is not None and pose is not None and depth_map is not None, "K, pose, and depth_map must be provided together"
+        if K is not None or train_pose is not None or train_depth is not None:
+            assert K is not None and train_pose is not None and train_depth is not None, "K, pose, and depth_map must be provided together"
         
         # Set rasterization settings on the fly based on input resolution
         if self.img_size is None:
@@ -268,12 +283,70 @@ class MEt3R(Module):
                 )
             self.rasterizer = PointsRasterizer(cameras=None, raster_settings=raster_settings)
         
-        if depth_map is None:
+        if train_depth is None:
             canon, ptmps = self._compute_canonical_point_map(images, return_ptmps=True)
         else:
-            canon = self.depth_to_pointmap(depth_map, K, pose[:3, :3], pose[:3, 3]) # (B, H, W, 3)
+            #train_pose[1, 3] = abs(train_pose[1, 3]) # make the y coordinate positive
+            #ood_pose[1, 3] = abs(ood_pose[1, 3])
+
+            Rt = train_pose[:3, :3]
+            tt = train_pose[:3, 3]
+            Rood = ood_pose[:3, :3]
+            tood = ood_pose[:3, 3]
             
-            _, ptmps = self._compute_canonical_point_map(images, return_ptmps=True)
+            # invert poses from wc to cw
+            Rt, tt = self.invert_pose(Rt, tt)
+            Rood, tood = self.invert_pose(Rood, tood)
+           
+            Rt_rel = Rood.T @ Rt
+            tt_rel = Rood.T @ (tt - tood)
+           
+           
+            # use the relative pose to get the point map for the ood image
+            ptmps = torch.zeros(images.shape[0], 2, h, w, 3).to(images.device)
+            ptmps[:, 1, ...] = self.depth_to_pointmap(train_depth, K, Rt_rel, tt_rel)
+            ptmps[:, 0, ...] = self.depth_to_pointmap(ood_depth, K, torch.eye(3), torch.zeros(3))
+            
+            
+            #ptmps = torch.zeros(images.shape[0], 2, h, w, 3).to(images.device)
+            #ptmps[:, 1, ...] = self.depth_to_pointmap(train_depth, K, train_pose[:3, :3], train_pose[:3, 3])
+            #ptmps[:, 0, ...] = self.depth_to_pointmap(ood_depth, K, ood_pose[:3, :3], ood_pose[:3, 3])            
+            
+            # canon is average of the two point maps
+            canon = ptmps[:,0,...]            
+            canon_old, ptmps_old = self._compute_canonical_point_map(images, return_ptmps=True) # (B, 2, H, W, 3)
+
+            plot_imgs = True
+            if plot_imgs:
+                from PIL import Image
+                import numpy as np  
+                # save the old and new point maps as RGB images
+                import matplotlib.pyplot as plt
+                
+                def plot_xyz_channels(data, filename):
+                    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+                    im1 = ax1.imshow(data[..., 0].cpu().numpy())
+                    im2 = ax2.imshow(data[..., 1].cpu().numpy())
+                    im3 = ax3.imshow(data[..., 2].cpu().numpy())
+                    ax1.set_title('X')
+                    ax2.set_title('Y') 
+                    ax3.set_title('Z')
+                    plt.colorbar(im1, ax=ax1)
+                    plt.colorbar(im2, ax=ax2)
+                    plt.colorbar(im3, ax=ax3)
+                    plt.savefig(filename)
+                    plt.close()
+
+                plot_xyz_channels(canon_old[0], "/home/ubuntu/captures/canon_old.jpg")
+                plot_xyz_channels(canon[0], "/home/ubuntu/captures/canon.jpg")
+                plot_xyz_channels(ptmps_old[0,0], "/home/ubuntu/captures/ptmps_old_0.jpg")
+                plot_xyz_channels(ptmps[0,0], "/home/ubuntu/captures/ptmps_0.jpg")
+                plot_xyz_channels(ptmps_old[0,1], "/home/ubuntu/captures/ptmps_old_1.jpg")
+                plot_xyz_channels(ptmps[0,1], "/home/ubuntu/captures/ptmps_1.jpg")
+                
+        
+            #canon = canon_old
+            #ptmps = ptmps_old
         
         # Define principal point
         pp = torch.tensor([w /2 , h / 2], device=canon.device)
@@ -287,22 +360,23 @@ class MEt3R(Module):
         pixels = xy_grid(W, H, device=canon.device).view(1, -1, 2) - pp.view(-1, 1, 2)  # B,HW,2
         canon = canon.flatten(1, 2)  # (B, HW, 3)
 
-        # direct estimation of focal
-        u, v = pixels.unbind(dim=-1)
-        x, y, z = canon.unbind(dim=-1)
-        fx_votes = (u * z) / x
-        fy_votes = (v * z) / y
+        if K is None:
+            # direct estimation of focal
+            u, v = pixels.unbind(dim=-1)
+            x, y, z = canon.unbind(dim=-1)
+            fx_votes = (u * z) / x
+            fy_votes = (v * z) / y
 
-        # assume square pixels, hence same focal for X and Y
-        f_votes = torch.stack((fx_votes.view(B, -1), fy_votes.view(B, -1)), dim=-1)
-        focal = torch.nanmedian(f_votes, dim=-2)[0]
+            # assume square pixels, hence same focal for X and Y
+            f_votes = torch.stack((fx_votes.view(B, -1), fy_votes.view(B, -1)), dim=-1)
+            focal = torch.nanmedian(f_votes, dim=-2)[0]
+            
+            # Normalized focal length
+            focal[..., 0] = 1 + focal[..., 0]/w
+            focal[..., 1] = 1 + focal[..., 1]/h
+            focal = repeat(focal, "b c -> (b k) c", k=2)
         
-        # Normalized focal length
-        focal[..., 0] = 1 + focal[..., 0]/w
-        focal[..., 1] = 1 + focal[..., 1]/h
-        focal = repeat(focal, "b c -> (b k) c", k=2)
-        
-        if K is not None:
+        else:
             focal = torch.tensor([
                 [K[0, 0], K[1, 1]],
                 [K[0, 0], K[1, 1]]
