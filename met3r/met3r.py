@@ -12,7 +12,7 @@ from einops import rearrange, repeat
 # Load featup
 from featup.util import norm, unnorm
 
-from sw.lib.py_utils.point_cloud import PointCloud
+from yugo.python.lib.py_utils.point_cloud import PointCloud
 
 # Load Pytorch3D
 from pytorch3d.structures import Pointclouds
@@ -393,26 +393,12 @@ class MEt3R(Module):
         # NOTE: Unproject feature on the point cloud
         ptmps = rearrange(ptmps, "b k h w c -> (b k) (h w) c", b=b, k=2)
         
-        if True: # save hr_feat as images      
-            ood_feat = hr_feat[0, :, :3].reshape(256,256,3).cpu().numpy()
-            train_feat = hr_feat[1, :, :3].reshape(256,256,3).cpu().numpy()
-            
-            ood_feat = (ood_feat - ood_feat.min()) / (ood_feat.max() - ood_feat.min()
-                                                    )
-            train_feat = (train_feat - train_feat.min()) / (train_feat.max() - train_feat.min())
-            
-            from PIL import Image
-            import numpy as np
-            ood_feat = Image.fromarray((ood_feat * 255).astype(np.uint8))
-            train_feat = Image.fromarray((train_feat * 255).astype(np.uint8))
-            
-            ood_feat.save("/home/ubuntu/captures/ood_feat.png")
-            train_feat.save("/home/ubuntu/captures/train_feat.png")
         
         # NOTE: Project and Render
-        R_rel, T_rel = self._get_relative_pose(ood_pose, train_pose)
-        R_rel = torch.tensor(R_rel, dtype=torch.float32, device=ptmps.device)
-        T_rel = torch.tensor(T_rel, dtype=torch.float32, device=ptmps.device)
+        if ood_pose is not None and train_pose is not None:
+            R_rel, T_rel = self._get_relative_pose(ood_pose, train_pose)
+            R_rel = torch.tensor(R_rel, dtype=torch.float32, device=ptmps.device)
+            T_rel = torch.tensor(T_rel, dtype=torch.float32, device=ptmps.device)
              
         point_cloud = Pointclouds(points=ptmps, features=hr_feat)
         
@@ -422,28 +408,6 @@ class MEt3R(Module):
         R = repeat(R, "... -> (b k) ...", b=b, k=2)
         T = torch.zeros(3,)
         T = repeat(T, "... -> (b k) ...", b=b, k=2)
-        
-        plot_pc = False
-        if plot_pc:
-            ptmps_ood_np = ptmps[0, ...].cpu().numpy()
-            ptmps_train_np = ptmps[1, ...].cpu().numpy()
-            ood_feat = hr_feat[0, :, :3].reshape(-1,3).cpu().numpy()
-            train_feat = hr_feat[1, :, :3].reshape(-1,3).cpu().numpy()
-            
-            ood_feat = (ood_feat - ood_feat.min()) / (ood_feat.max() - ood_feat.min())
-            train_feat = (train_feat - train_feat.min()) / (train_feat.max() - train_feat.min())
-            
-            ood_feat = (ood_feat * 255).astype(np.uint8)
-            train_feat = (train_feat * 255).astype(np.uint8)
-            
-            pc_ood = PointCloud(ids=np.arange(ptmps[0, ...].shape[0], dtype=np.uint64), coords=ptmps_ood_np, colors=ood_feat)
-            pc_train = PointCloud(ids=np.arange(ptmps[1, ...].shape[0], dtype=np.uint64), coords=ptmps_train_np, colors=train_feat)
-            
-            # write pc_ood to file
-            pc_ood.write_bin("/home/ubuntu/rec/pc_ood.dpc")
-            pc_train.write_bin("/home/ubuntu/rec/pc_train.dpc")
-            
-        
         
         # Define Pytorch3D camera for projection
         cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal)
