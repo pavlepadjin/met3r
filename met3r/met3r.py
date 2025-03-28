@@ -330,6 +330,8 @@ class MEt3R(Module):
             assert K is not None and train_pose is not None and train_depth is not None, \
                 'K, pose, and depth_map must be provided together'
 
+        use_depth = train_depth is not None
+
         # Set rasterization settings on the fly based on input resolution
         if self.img_size is None:
             raster_settings = PointsRasterizationSettings(
@@ -340,14 +342,14 @@ class MEt3R(Module):
                 )
             self.rasterizer = PointsRasterizer(cameras=None, raster_settings=raster_settings)
 
-        if train_depth is None:
+        if not use_depth:
             canon, ptmps = self._compute_canonical_point_map(images, return_ptmps=True)
+            pp = torch.tensor([w /2 , h / 2], device=canon.device)
         else:
 
             canon, ptmps = self._canonical_point_map_from_depth(train_depth, ood_depth, K, train_pose, ood_pose)
+            pp = torch.tensor([[K[0, 2], K[1, 2]]], device=canon.device)
             
-        # Define principal point
-        pp = torch.tensor([w /2 , h / 2], device=canon.device)
     
         # NOTE: Estimating fx and fy for a given canonical point map
         B, H, W, THREE = canon.shape
@@ -357,7 +359,7 @@ class MEt3R(Module):
         pixels = xy_grid(W, H, device=canon.device).view(1, -1, 2) - pp.view(-1, 1, 2)  # B,HW,2
         canon = canon.flatten(1, 2)  # (B, HW, 3)
 
-        if K is None:
+        if not use_depth:
             # direct estimation of focal
             u, v = pixels.unbind(dim=-1)
             x, y, z = canon.unbind(dim=-1)
@@ -374,13 +376,12 @@ class MEt3R(Module):
             focal = repeat(focal, 'b c -> (b k) c', k=2)
 
         else:
+            # when using depth, we are passing the unnormalized focal length
             focal = torch.tensor([
                 [K[0, 0], K[1, 1]],
                 [K[0, 0], K[1, 1]]
             ]).to(dtype=torch.float32, device=canon.device)
-            focal[..., 0] = 1 + focal[..., 0] / w
-            focal[..., 1] = 1 + focal[..., 1] / h
-
+            
         # NOTE: Getting high-resolution features from FeatUp
         b, k, *_ = images.shape
         images = rearrange(images, 'b k c h w -> (b k) c h w')
@@ -424,7 +425,15 @@ class MEt3R(Module):
         T = repeat(T, '... -> (b k) ...', b=b, k=2)
 
         # Define Pytorch3D camera for projection
-        cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal)
+        if use_depth:
+            image_size=torch.tensor([[h, w]])
+            cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal, principal_point=pp, in_ndc=False, image_size=image_size)
+        else:
+             # Normalized focal length
+            focal[..., 0] = 1 + focal[..., 0] / w
+            focal[..., 1] = 1 + focal[..., 1] / h
+            focal = repeat(focal, 'b c -> (b k) c', k=2)
+            cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal)
 
         # Render via point rasterizer to get projected features
         with torch.autocast('cuda', enabled=False):
