@@ -345,10 +345,7 @@ class MEt3R(Module):
         else:
 
             canon, ptmps = self._canonical_point_map_from_depth(train_depth, ood_depth, K, train_pose, ood_pose)
-
-        if only_ptmps:
-            return ptmps
-
+            
         # Define principal point
         pp = torch.tensor([w /2 , h / 2], device=canon.device)
     
