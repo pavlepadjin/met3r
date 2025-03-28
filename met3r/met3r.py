@@ -12,8 +12,6 @@ from einops import rearrange, repeat
 # Load featup
 from featup.util import norm, unnorm
 
-from sw.lib.py_utils.point_cloud import PointCloud
-
 # Load Pytorch3D
 from pytorch3d.structures import Pointclouds
 from pytorch3d.renderer import (
@@ -24,7 +22,6 @@ from pytorch3d.renderer import (
     PointsRasterizer,
     AlphaCompositor,
 )
-from pytorch3d.transforms import Transform3d
 
 import sys
 import os
@@ -200,29 +197,24 @@ class MEt3R(Module):
         return points_world.unsqueeze(0)
     
     
-    def _get_relative_pose(self, train_pose, ood_pose):
+    def _canonical_point_map_from_depth(self, train_depth, ood_depth, K, train_pose, ood_pose):
+        h, w = train_depth.shape[-2:]
         Rt = train_pose[:3, :3]
         tt = train_pose[:3, 3]
         Rood = ood_pose[:3, :3]
         tood = ood_pose[:3, 3]
         
+        # invert poses from wc to cw
         Rt, tt = self.invert_pose(Rt, tt)
         Rood, tood = self.invert_pose(Rood, tood)
         
         Rt_rel = Rood.T @ Rt
         tt_rel = Rood.T @ (tt - tood)
-        return Rt_rel, tt_rel
-    
-    def _canonical_point_map_from_depth(self, train_depth, ood_depth, K, train_pose, ood_pose):
-        h, w = train_depth.shape[-2:]
-        
-        Rt_rel, tt_rel = self._get_relative_pose(train_pose, ood_pose)
         
         # use the relative pose to get the point map for the ood image
         ptmps = torch.zeros(train_depth.shape[0], 2, h, w, 3).to(train_depth.device)
-        ptmps[:, 0, ...] = self.depth_to_pointmap(ood_depth, K, torch.eye(3), torch.zeros(3))
-        ptmps[:, 1, ...] = self.depth_to_pointmap(train_depth, K, Rt_rel, tt_rel)
-        
+        ptmps[:, 0, ...] = self.depth_to_pointmap(train_depth, K, Rt_rel, tt_rel)
+        ptmps[:, 1, ...] = self.depth_to_pointmap(ood_depth, K, torch.eye(3), torch.zeros(3))
         
         canon = ptmps[:,0,...]      
         
@@ -264,6 +256,9 @@ class MEt3R(Module):
 
         return images, fragments.zbuf
     
+
+    # NOTE: Assuming that input[0] is ood and input[1] is train
+    # !!!!!!! Generalize this later
     def forward(
         self, 
         train_rgb: Float[Tensor, "b 3 h w"],
@@ -299,8 +294,8 @@ class MEt3R(Module):
         
         
         images = torch.zeros(1, 2, *train_rgb.shape).to(train_rgb.device)
-        images[0,0] = ood_rgb
-        images[0,1] = train_rgb
+        images[0,1] = ood_rgb
+        images[0,0] = train_rgb
         *_, h, w = images.shape
         
         if K is not None or train_pose is not None or train_depth is not None:
@@ -392,59 +387,16 @@ class MEt3R(Module):
         
         # NOTE: Unproject feature on the point cloud
         ptmps = rearrange(ptmps, "b k h w c -> (b k) (h w) c", b=b, k=2)
-        
-        if True: # save hr_feat as images      
-            ood_feat = hr_feat[0, :, :3].reshape(256,256,3).cpu().numpy()
-            train_feat = hr_feat[1, :, :3].reshape(256,256,3).cpu().numpy()
-            
-            ood_feat = (ood_feat - ood_feat.min()) / (ood_feat.max() - ood_feat.min()
-                                                    )
-            train_feat = (train_feat - train_feat.min()) / (train_feat.max() - train_feat.min())
-            
-            from PIL import Image
-            import numpy as np
-            ood_feat = Image.fromarray((ood_feat * 255).astype(np.uint8))
-            train_feat = Image.fromarray((train_feat * 255).astype(np.uint8))
-            
-            ood_feat.save("/home/ubuntu/captures/ood_feat.png")
-            train_feat.save("/home/ubuntu/captures/train_feat.png")
-        
-        # NOTE: Project and Render
-        R_rel, T_rel = self._get_relative_pose(ood_pose, train_pose)
-        R_rel = torch.tensor(R_rel, dtype=torch.float32, device=ptmps.device)
-        T_rel = torch.tensor(T_rel, dtype=torch.float32, device=ptmps.device)
-             
         point_cloud = Pointclouds(points=ptmps, features=hr_feat)
         
+        # NOTE: Project and Render
         R = torch.eye(3)
         R[0, 0] *= -1
         R[1, 1] *= -1
         R = repeat(R, "... -> (b k) ...", b=b, k=2)
-        T = torch.zeros(3,)
+        T = torch.zeros((3, ))
         T = repeat(T, "... -> (b k) ...", b=b, k=2)
-        
-        plot_pc = False
-        if plot_pc:
-            ptmps_ood_np = ptmps[0, ...].cpu().numpy()
-            ptmps_train_np = ptmps[1, ...].cpu().numpy()
-            ood_feat = hr_feat[0, :, :3].reshape(-1,3).cpu().numpy()
-            train_feat = hr_feat[1, :, :3].reshape(-1,3).cpu().numpy()
-            
-            ood_feat = (ood_feat - ood_feat.min()) / (ood_feat.max() - ood_feat.min())
-            train_feat = (train_feat - train_feat.min()) / (train_feat.max() - train_feat.min())
-            
-            ood_feat = (ood_feat * 255).astype(np.uint8)
-            train_feat = (train_feat * 255).astype(np.uint8)
-            
-            pc_ood = PointCloud(ids=np.arange(ptmps[0, ...].shape[0], dtype=np.uint64), coords=ptmps_ood_np, colors=ood_feat)
-            pc_train = PointCloud(ids=np.arange(ptmps[1, ...].shape[0], dtype=np.uint64), coords=ptmps_train_np, colors=train_feat)
-            
-            # write pc_ood to file
-            pc_ood.write_bin("/home/ubuntu/rec/pc_ood.dpc")
-            pc_train.write_bin("/home/ubuntu/rec/pc_train.dpc")
-            
-        
-        
+
         # Define Pytorch3D camera for projection
         cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal)
         
