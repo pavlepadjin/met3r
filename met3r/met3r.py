@@ -141,110 +141,88 @@ class MEt3R(Module):
             outputs.append(ptmps)
         return (*outputs, )
     
+    @staticmethod
+    def invert_pose(R, t):
+        R_inv = R.T
+        t_inv = -R_inv @ t
+        return R_inv, t_inv
 
     @staticmethod
-    def depth_to_pointmap(
-            depth_map: torch.Tensor,
-            camera_matrix: torch.Tensor,
-            ) -> PointCloud:
+    def depth_to_pointmap(depth_map, K, R, t):
         """
-        Creates PointCloud object given the depth map and camera intrinsics.
-        Optional RGB colors, camera pose and normals are supported.
-
-        Args:
-            depth_map: Depth map of shape [<height>, <width>] or [<height>, <width>, 1].
-            camera_matrix: Pinhole camera intrinsics matrix of shape [4, 4].
-            normal_map: Optional normal map of shape [<height>, <width>, 3].
-            color_image: Optional color image of shape [height, width] or [height, width, 1] if grayscale
-                and [height, width, 3] if RGB image.
-            camera_pose: Optional camera extrinsics matrix of shape [4, 4].
-        Rets:
-            PointCloud object created from the given data.
-        """
-        # Validate depth map
-        assert depth_map.dim() in [2, 3]
-    
-        if depth_map.dim() == 3:
-            assert depth_map.shape[2] == 1
-            depth_map = depth_map[:, :, 0]
-        depth_map = depth_map.to(dtype=torch.float32)
-
-        # Validate intrinsics matrix
-        assert camera_matrix.shape == (4, 4)
-        camera_matrix = camera_matrix.to(dtype=torch.float32)
-
-        valid_mask = depth_map > 0  # [H, W]
-        valid_mask = valid_mask.reshape(-1)  # [H*W]
-
-        H, W = depth_map.shape
-        inv_camera_matrix = torch.inverse(camera_matrix)
-
-        # Create pixel grid
-        y, x = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
-        x = x.unsqueeze(-1)  # [H, W, 1]
-        y = y.unsqueeze(-1)  # [H, W, 1]
-        grid = torch.cat([x, y], dim=-1)  # [H, W, 2]
-
-        # Convert to homogenous coordinates
-        grid = grid.reshape(-1, 2)  # [H*W, 2]
-        grid = torch.cat([grid, torch.ones(H * W, 1), torch.ones(H * W, 1)], dim=-1)  # [H*W, 4]
-        grid = grid.t()  # [4, H*W]
-        grid = grid.to(dtype=torch.float32, device=depth_map.device)  # [4, H*W]
-
-        # Project pixels into 3D world, onto the camera plane
-        points_3d = torch.matmul(inv_camera_matrix, grid)  # [4, H*W]
-        points_3d = points_3d.t()  # [H*W, 4]
-        points_3d = points_3d.reshape(H, W, 4)  # [H, W, 4]
-
-        # Project points from camera plane to real world points
-        depth = depth_map.unsqueeze(-1)  # [H, W, 1]
-        points_3d[:, :, :3] *= depth
-
-        # Remove homogenous coordinate
-        pointmap = points_3d[:, :, :3]
+        Convert a depth map to a 3D point map using camera intrinsics and extrinsics.
+        Assumes R and t are in world-to-camera form (P_camera = R*P_world + t).
+        Will convert to camera-to-world internally.
         
-        return pointmap
-    
-    def _get_relative_pose(self, train_pose, ood_pose):
-        """A relative transformation from train to ood camera coordinate system
+        Args:
+            depth_map (torch.Tensor): Depth map of shape (H, W).
+            K (torch.Tensor): Camera intrinsic matrix of shape (3, 3).
+            R (torch.Tensor): World-to-camera rotation matrix of shape (3, 3).
+            t (torch.Tensor): World-to-camera translation vector of shape (3, 1).
 
         Returns:
-            Rt_rel: relative rotation matrix
-            tt_rel: relative translation vector
+            torch.Tensor: 3D point map of shape (H, W, 3) in world coordinates.
         """
-        assert train_pose.shape == (4, 4)
-        assert ood_pose.shape == (4, 4)
-        train_pose_inv = torch.inverse(train_pose)
-        rel_pose = ood_pose @ train_pose_inv
-        return rel_pose 
+        H, W = depth_map.shape[-2:]
+        
+        R = torch.tensor(R, dtype=torch.float32, device=depth_map.device)
+        t = torch.tensor(t, dtype=torch.float32, device=depth_map.device)
+
+        # Create mesh grid of pixel coordinates
+        y, x = torch.meshgrid(torch.arange(H, device=depth_map.device), 
+                            torch.arange(W, device=depth_map.device), indexing='ij')
+
+        # Convert pixel coordinates to normalized camera coordinates
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+
+        X_c = (x.float() - cx) * depth_map / fx
+        Y_c = (y.float() - cy) * depth_map / fy
+        Z_c = depth_map
+
+        # Stack to get camera coordinates (H, W, 3)
+        points_camera = torch.stack((X_c, Y_c, Z_c), dim=-1)  # Shape: (H, W, 3)
+
+        # Reshape for matrix multiplication (3, H*W)
+        points_camera_reshaped = points_camera.reshape(-1, 3).T  # (3, H*W)
+
+        # Convert world-to-camera transform to camera-to-world transform
+        # If P_camera = R * P_world + t
+        # Then P_world = R^T * (P_camera - t)
+        #R, t = MEt3R.invert_pose(R, t)
+
+        # Convert to world coordinates using camera-to-world transform
+        points_world = R @ points_camera_reshaped + t.unsqueeze(-1)  # (3, H*W)
+
+        # Reshape back to (H, W, 3)
+        points_world = points_world.T.reshape(H, W, 3)
+
+        return points_world.unsqueeze(0)
     
-    def transform_pointmap(self, pointmap, pose):
-        """Transform a pointmap using a pose matrix
-        """
-        assert pointmap.dim() == 4 # [B==1, H, W, 3]
-        assert pointmap.shape[-1] == 3
-        assert pose.shape == (4, 4)
-        points = pointmap.reshape(-1, 3) # [N, 3]
-        points = torch.cat([points, torch.ones(points.shape[0], 1, device=pointmap.device)], dim=-1) # [N, 4]
-        points = points.t() # [4, N]
-        points = pose @ points # [4, N]
-        points = points.t() # [N, 4]
-        points = points[:, :3] # [N, 3]
-        return points.reshape(pointmap.shape[0], pointmap.shape[1], pointmap.shape[2], 3) # [B==1, H, W, 3]
+    
+    def _get_relative_pose(self, train_pose, ood_pose):
+        Rt = train_pose[:3, :3]
+        tt = train_pose[:3, 3]
+        Rood = ood_pose[:3, :3]
+        tood = ood_pose[:3, 3]
+        
+        Rt, tt = self.invert_pose(Rt, tt)
+        Rood, tood = self.invert_pose(Rood, tood)
+        
+        Rt_rel = Rood.T @ Rt
+        tt_rel = Rood.T @ (tt - tood)
+        return Rt_rel, tt_rel
     
     def _canonical_point_map_from_depth(self, train_depth, ood_depth, K, train_pose, ood_pose):
         h, w = train_depth.shape[-2:]
         
-        rel_pose = self._get_relative_pose(train_pose, ood_pose)
+        Rt_rel, tt_rel = self._get_relative_pose(train_pose, ood_pose)
         
         # use the relative pose to get the point map for the ood image
         ptmps = torch.zeros(train_depth.shape[0], 2, h, w, 3).to(train_depth.device)
-        camera_matrix = torch.eye(4).to(train_depth.device)
-        camera_matrix[:3, :3] = K
-        ptmps[:, 0, ...] = self.depth_to_pointmap(ood_depth.squeeze(), camera_matrix)
-        ptmps[:, 1, ...] = self.depth_to_pointmap(train_depth.squeeze(), camera_matrix)
+        ptmps[:, 0, ...] = self.depth_to_pointmap(ood_depth, K, torch.eye(3), torch.zeros(3))
+        ptmps[:, 1, ...] = self.depth_to_pointmap(train_depth, K, Rt_rel, tt_rel)
         
-        ptmps[:, 1, ...] = self.transform_pointmap(ptmps[:, 1, ...], rel_pose)
         
         canon = ptmps[:,0,...]      
         
@@ -297,9 +275,7 @@ class MEt3R(Module):
         ood_depth: Float[Tensor, "b h w"] | None = None,
         K: Float[Tensor, "b 3 3"] | None = None,
         train_pose: Float[Tensor, "b 4 4"] | None = None,
-        ood_pose: Float[Tensor, "b 4 4"] | None = None,
-        return_ptmps: bool=False,
-        use_dust3r: bool=False
+        ood_pose: Float[Tensor, "b 4 4"] | None = None
     ) -> Tuple[
             float, 
             Bool[Tensor, "b h w"] | None, 
@@ -340,7 +316,7 @@ class MEt3R(Module):
                 )
             self.rasterizer = PointsRasterizer(cameras=None, raster_settings=raster_settings)
         
-        if use_dust3r or train_depth is None:
+        if train_depth is None:
             canon, ptmps = self._compute_canonical_point_map(images, return_ptmps=True)
         else:
 
@@ -420,9 +396,9 @@ class MEt3R(Module):
         
         # NOTE: Project and Render
         if ood_pose is not None and train_pose is not None:
-            pose_rel = self._get_relative_pose(ood_pose, train_pose)
-            R_rel = pose_rel[:3, :3].to(dtype=torch.float32, device=ptmps.device)
-            T_rel = pose_rel[:3, 3].to(dtype=torch.float32, device=ptmps.device)
+            R_rel, T_rel = self._get_relative_pose(ood_pose, train_pose)
+            R_rel = torch.tensor(R_rel, dtype=torch.float32, device=ptmps.device)
+            T_rel = torch.tensor(T_rel, dtype=torch.float32, device=ptmps.device)
              
         point_cloud = Pointclouds(points=ptmps, features=hr_feat)
         
@@ -471,9 +447,6 @@ class MEt3R(Module):
         
         if return_projections:
             outputs.append(rendering)
-            
-        if return_ptmps:
-            outputs.append(ptmps)
 
         return (*outputs, )
 
