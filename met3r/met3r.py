@@ -182,7 +182,7 @@ class MEt3R(Module):
             feat_dissim_maps (bool[Tensor, "b h w"], optional): Feature dissimilarity score map
             proj_feats (bool[Tensor, "b h w c"], optional): Projected and rendered features
         """
-        
+        print_memory_usage()
         
         *_, h, w = images.shape
         
@@ -201,6 +201,7 @@ class MEt3R(Module):
         view1 = {"img": images[:, 0, ...], "instance": [""]}
         view2 = {"img": images[:, 1, ...], "instance": [""]}
         pred1, pred2 = self.dust3r(view1, view2)
+        print_memory_usage()
 
         ptmps = torch.stack([pred1["pts3d"], pred2["pts3d_in_other_view"]], dim=1).detach()
         conf = torch.stack([pred1["conf"], pred2["conf"]], dim=1).detach()
@@ -235,6 +236,7 @@ class MEt3R(Module):
         focal[..., 0] = 1 + focal[..., 0]/w
         focal[..., 1] = 1 + focal[..., 1]/h
         focal = repeat(focal, "b c -> (b k) c", k=2)
+        print_memory_usage()
         
         # NOTE: Getting high-resolution features from FeatUp
         b, k, *_ = images.shape
@@ -274,6 +276,7 @@ class MEt3R(Module):
             hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode="nearest")
             hr_feat = rearrange(hr_feat, "... c h w -> ... (h w) c")
                 
+        print_memory_usage()    
         
         # NOTE: Unproject feature on the point cloud
         ptmps = rearrange(ptmps, "b k h w c -> (b k) (h w) c", b=b, k=2)
@@ -289,11 +292,13 @@ class MEt3R(Module):
 
         # Define Pytorch3D camera for projection
         cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal)
+        print_memory_usage()
         
         # Render via point rasterizer to get projected features
         with torch.autocast("cuda", enabled=False):
             rendering, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
         rendering = rearrange(rendering, "(b k) ... -> b k ...",  b=b, k=2)
+        print_memory_usage()
 
         # Compute overlapping mask
         non_overlap_mask = (rendering == -10000)
@@ -315,6 +320,7 @@ class MEt3R(Module):
         feat_dissim_maps = 1 - (rendering[:, 1, ...] * rendering[:, 0, ...]).sum(-1) / (torch.linalg.norm(rendering[:, 1, ...], dim=-1) * torch.linalg.norm(rendering[:, 0, ...], dim=-1) + 1e-3)  
         # Weight feature dissimilarity score map with computed mask
         feat_dissim_weighted = (feat_dissim_maps * mask).sum(-1).sum(-1)  / (mask.sum(-1).sum(-1) + 1e-6)
+        print_memory_usage()
         
         outputs = [feat_dissim_weighted]
         if return_overlap_mask:
