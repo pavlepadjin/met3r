@@ -326,4 +326,3 @@ class MEt3R(Module):
             outputs.append(rendering)
 
         return (*outputs, )
-
