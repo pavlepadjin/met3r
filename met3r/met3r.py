@@ -299,7 +299,8 @@ class MEt3R(Module):
         K: Float[Tensor, 'b 3 3'] | None = None,
         train_pose: Float[Tensor, 'b 4 4'] | None = None,
         ood_pose: Float[Tensor, 'b 4 4'] | None = None,
-        return_ptmps: bool = False
+        return_ptmps: bool = False,
+        use_dust3r: bool = False
     ) -> Tuple[
             float,
             Bool[Tensor, 'b h w'] | None,
@@ -340,14 +341,11 @@ class MEt3R(Module):
                 )
             self.rasterizer = PointsRasterizer(cameras=None, raster_settings=raster_settings)
 
-        if train_depth is None:
+        if use_dust3r or train_depth is None:
             canon, ptmps = self._compute_canonical_point_map(images, return_ptmps=True)
         else:
 
             canon, ptmps = self._canonical_point_map_from_depth(train_depth, ood_depth, K, train_pose, ood_pose)
-
-        if only_ptmps:
-            return ptmps
 
         # Define principal point
         pp = torch.tensor([w /2 , h / 2], device=canon.device)
