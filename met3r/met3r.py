@@ -95,33 +95,12 @@ class MEt3R(Module):
             self.dust3r = AsymmetricCroCo3DStereo.from_pretrained(dust3r_weights)
 
         if self.img_size is not None:
-            self.set_rasterizer(
-                image_size=img_size,
-                points_per_pixel=10,
-                bin_size=0,
-                **kwargs
-            )
-
+            self.__init_rasterizer(img_size, img_size, **kwargs)
+            
         self.compositor = AlphaCompositor()
 
         freeze(self.dust3r)
         freeze(self.upsampler)
-
-    def set_rasterizer(
-        self,
-        image_size,
-        points_per_pixel=10,
-        bin_size=0,
-        **kwargs
-    ) -> None:
-        raster_settings = PointsRasterizationSettings(
-            image_size=image_size,
-            points_per_pixel=points_per_pixel,
-            bin_size=bin_size,
-            **kwargs
-        )
-
-        self.rasterizer = PointsRasterizer(cameras=None, raster_settings=raster_settings)
 
     def _compute_canonical_point_map(
             self,
@@ -252,7 +231,6 @@ class MEt3R(Module):
     def __init_rasterizer(self, h, w, points_per_pixel=10, radius=0.01, bin_size=0, max_points_per_bin=None, **kwargs):
         """A helper method to initialize the rasterizer.
         """
-        radius = 0.05
         raster_settings = PointsRasterizationSettings(
             image_size=(h, w),
             radius=radius,
@@ -263,7 +241,7 @@ class MEt3R(Module):
         self.rasterizer = PointsRasterizer(cameras=None, raster_settings=raster_settings)
         
     
-    def __get_rt_pytorch3d(self, train_pose, ood_pose, device="cuda"):
+    def __get_rt_pytorch3d(self, device="cuda"):
         """Get the default rotation and translation matrices for Pytorch3D
         """
         R = torch.eye(3)
@@ -355,14 +333,72 @@ class MEt3R(Module):
         ptmps = rearrange(ptmps, 'b k h w c -> (b k) (h w) c', b=b, k=2)
         point_cloud = Pointclouds(points=ptmps, features=hr_feat)
             
-        R, T = self.__get_rt_pytorch3d(train_pose, ood_pose, device=ptmps.device)
+        R, T = self.__get_rt_pytorch3d(device=ptmps.device)
         image_size = torch.tensor([[h, w]])
         cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal, principal_point=pp, in_ndc=False, image_size=image_size)
         
         with torch.autocast('cuda', enabled=False):
             rendering, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
         rendering = rearrange(rendering, '(b k) ... -> b k ...',  b=b, k=2)
-        return rendering, ptmps
+        return rendering, zbuf, ptmps
+    
+    def dust3r_forward(self, train_rgb, ood_rgb, **kwargs):
+        """
+        Forward function to compute MET3R from dust3r pointmaps.
+        """
+        images = torch.zeros(1, 2, *train_rgb.shape).to(train_rgb.device)
+        images[0, 0] = ood_rgb
+        images[0, 1] = train_rgb
+        *_, H, W = images.shape
+        
+        self.__init_rasterizer(H, W, **kwargs)
+        
+        canon, ptmps = self._compute_canonical_point_map(images, return_ptmps=True)
+        pp = torch.tensor([W /2 , H / 2], device=canon.device)
+        B = canon.shape[0]
+        
+        # centered pixel grid
+        pixels = xy_grid(W, H, device=canon.device).view(1, -1, 2) - pp.view(-1, 1, 2)  # B,HW,2
+        canon = canon.flatten(1, 2)  # (B, HW, 3)
+
+        # direct estimation of focal
+        u, v = pixels.unbind(dim=-1)
+        x, y, z = canon.unbind(dim=-1)
+        fx_votes = (u * z) / x
+        fy_votes = (v * z) / y
+        
+        # assume square pixels, hence same focal for X and Y
+        f_votes = torch.stack((fx_votes.view(B, -1), fy_votes.view(B, -1)), dim=-1)
+        focal = torch.nanmedian(f_votes, dim=-2)[0]
+
+        # Normalized focal length
+        focal[..., 0] = 1 + focal[..., 0] / W
+        focal[..., 1] = 1 + focal[..., 1] / H
+        focal = repeat(focal, 'b c -> (b k) c', k=2)
+
+        # DINO + featup forward pass
+        hr_feat = self.upsampler(norm(images))
+        hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='bilinear')
+        hr_feat = rearrange(hr_feat, '... c h w -> ... (h w) c')
+        
+        # NOTE: Unproject feature on the point cloud
+        ptmps = rearrange(ptmps, 'b k h w c -> (b k) (h w) c', b=B, k=2)
+        point_cloud = Pointclouds(points=ptmps, features=hr_feat)
+        
+        R, T = self.__get_rt_pytorch3d(device=ptmps.device)
+        
+        # prepare focal length for pytorch3d in NDC system
+        focal[..., 0] = 1 + focal[..., 0] / W
+        focal[..., 1] = 1 + focal[..., 1] / H
+        focal = repeat(focal, 'b c -> (b k) c', k=2)
+        cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal)
+
+        with torch.autocast('cuda', enabled=False):
+            rendering, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
+        rendering = rearrange(rendering, '(b k) ... -> b k ...',  b=B, k=2)
+
+        return rendering, zbuf, ptmps
+
 
     def forward(
         self,
@@ -378,6 +414,7 @@ class MEt3R(Module):
         ood_pose: Float[Tensor, 'b 4 4'] | None = None,
         use_rgb_as_features: bool = False,
         return_ptmps: bool = False,
+        use_oclusion_mask: bool = True,
         **kwargs
     ) -> Tuple[
             float,
@@ -400,10 +437,6 @@ class MEt3R(Module):
             proj_feats (bool[Tensor, "b h w c"], optional): Projected and rendered features
         """
         
-        images = torch.zeros(1, 2, *train_rgb.shape).to(train_rgb.device)
-        images[0, 0] = ood_rgb
-        images[0, 1] = train_rgb
-        *_, h, w = images.shape
 
         if K is not None or train_pose is not None or train_depth is not None:
             assert K is not None and train_pose is not None and train_depth is not None, \
@@ -412,116 +445,9 @@ class MEt3R(Module):
         use_depth = train_depth is not None
         
         if use_depth:
-            rendering, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, ood_depth, K, train_pose, ood_pose, use_rgb_as_features, **kwargs)
+            rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, ood_depth, K, train_pose, ood_pose, use_rgb_as_features, **kwargs)
         else:
-            # Set rasterization settings on the fly based on input resolution
-            if self.img_size is None:
-                raster_settings = PointsRasterizationSettings(
-                    image_size=(h, w),
-                    radius=0.01,
-                    points_per_pixel=10,
-                    bin_size=0
-                    )
-                self.rasterizer = PointsRasterizer(cameras=None, raster_settings=raster_settings)
-
-            if not use_depth:
-                canon, ptmps = self._compute_canonical_point_map(images, return_ptmps=True)
-                pp = torch.tensor([w /2 , h / 2], device=canon.device)
-            else:
-
-                canon, ptmps = self.__ptmps_from_depth(train_depth, ood_depth, K, train_pose, ood_pose)
-                pp = torch.tensor([[K[0, 2], K[1, 2]]], device=canon.device)
-
-            # NOTE: Estimating fx and fy for a given canonical point map
-            B, H, W, THREE = canon.shape
-            assert THREE == 3
-
-            # centered pixel grid
-            pixels = xy_grid(W, H, device=canon.device).view(1, -1, 2) - pp.view(-1, 1, 2)  # B,HW,2
-            canon = canon.flatten(1, 2)  # (B, HW, 3)
-
-            if not use_depth:
-                # direct estimation of focal
-                u, v = pixels.unbind(dim=-1)
-                x, y, z = canon.unbind(dim=-1)
-                fx_votes = (u * z) / x
-                fy_votes = (v * z) / y
-
-                # assume square pixels, hence same focal for X and Y
-                f_votes = torch.stack((fx_votes.view(B, -1), fy_votes.view(B, -1)), dim=-1)
-                focal = torch.nanmedian(f_votes, dim=-2)[0]
-
-                # Normalized focal length
-                focal[..., 0] = 1 + focal[..., 0] / w
-                focal[..., 1] = 1 + focal[..., 1] / h
-                focal = repeat(focal, 'b c -> (b k) c', k=2)
-
-            else:
-                # when using depth, we are passing the unnormalized focal length
-                focal = torch.tensor([
-                    [K[0, 0], K[1, 1]],
-                    [K[0, 0], K[1, 1]]
-                ]).to(dtype=torch.float32, device=canon.device)
-                
-            # NOTE: Getting high-resolution features from FeatUp
-            b, k, *_ = images.shape
-            images = rearrange(images, 'b k c h w -> (b k) c h w')
-            images = (images + 1) / 2
-
-            if use_rgb_as_features:
-                hr_feat = images.reshape(b*k, 3, h* w).permute(0, 2, 1)
-            elif self.use_featup:
-                # Some feature backbone may result in a different resolution feature maps than the inputs
-                hr_feat = self.upsampler(norm(images))
-                hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='bilinear')
-                hr_feat = rearrange(hr_feat, '... c h w -> ... (h w) c')
-
-            elif self.use_dust3r_features:
-                # NOTE: Only for Ablation (Not to be used for measuring consistency)
-                shape = torch.tensor(images.shape[-2:])[None].repeat(b, 1)
-                images = rearrange(images, '(b k) c h w -> b k c h w', b=b, k=k)
-                images = 2 * images - 1
-                feat1, feat2, pos1, pos2 = self.dust3r._encode_image_pairs(images[:, 0], images[:, 1], shape, shape)
-                images = (images + 1) / 2
-                images = rearrange(images, 'b k c h w -> (b k) c h w')
-
-                hr_feat = torch.stack([feat1, feat2], dim=1)
-                hr_feat = rearrange(hr_feat, 'b k (h w) c -> (b k) c h w', h=14, w=14)
-                hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='bilinear')
-                hr_feat = rearrange(hr_feat, '... c h w -> ... (h w) c')
-
-            else:
-                hr_feat = self.upsampler.model(norm(images))
-                hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='nearest')
-                hr_feat = rearrange(hr_feat, '... c h w -> ... (h w) c')
-
-            # NOTE: Unproject feature on the point cloud
-            ptmps = rearrange(ptmps, 'b k h w c -> (b k) (h w) c', b=b, k=2)
-
-            point_cloud = Pointclouds(points=ptmps, features=hr_feat)
-
-            R = torch.eye(3)
-            R[0, 0] *= -1
-            R[1, 1] *= -1
-            R = repeat(R, '... -> (b k) ...', b=b, k=2)
-            T = torch.zeros(3,)
-            T = repeat(T, '... -> (b k) ...', b=b, k=2)
-
-            # Define Pytorch3D camera for projection
-            if use_depth:
-                image_size=torch.tensor([[h, w]])
-                cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal, principal_point=pp, in_ndc=False, image_size=image_size)
-            else:
-                # Normalized focal length
-                focal[..., 0] = 1 + focal[..., 0] / w
-                focal[..., 1] = 1 + focal[..., 1] / h
-                focal = repeat(focal, 'b c -> (b k) c', k=2)
-                cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal)
-
-            # Render via point rasterizer to get projected features
-            with torch.autocast('cuda', enabled=False):
-                rendering, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
-            rendering = rearrange(rendering, '(b k) ... -> b k ...',  b=b, k=2)
+            rendering, zbuf, ptmps = self.dust3r_forward(train_rgb, ood_rgb, **kwargs)
 
         # Compute overlapping mask
         non_overlap_mask = (rendering == -10000)
@@ -532,12 +458,14 @@ class MEt3R(Module):
 
         # Mask for weighted sum
         mask = overlap_mask
-
+        
         # NOTE: Uncomment for incorporating occlusion masks along with overlap mask
-        # zbuf = rearrange(zbuf, "(b k) ... -> b k ...",  b=b, k=2)
-        # closest_z = zbuf[..., 0]
-        # diff = (closest_z[:, 0, ...] - closest_z[:, 1, ...]).abs()
-        # mask = (~(diff > 0.5) * (closest_z != -1).prod(1)) * mask
+        if use_oclusion_mask:
+            zbuf = rearrange(zbuf, "(b k) ... -> b k ...",  b=1, k=2)
+            closest_z = zbuf[..., 0]
+            # ood_depth - gt_depth_from_ood_pose
+            diff = (closest_z[:, 0, ...] - closest_z[:, 1, ...]).abs()
+            mask = (~(diff > 5.0) * (closest_z != -1).prod(1)) * mask
 
         # Get feature dissimilarity score map
         feat_dissim_maps = 1 - (rendering[:, 1, ...] * rendering[:, 0, ...]).sum(-1) / (torch.linalg.norm(rendering[:, 1, ...], dim=-1) * torch.linalg.norm(rendering[:, 0, ...], dim=-1) + 1e-3)
