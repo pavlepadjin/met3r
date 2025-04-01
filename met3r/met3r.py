@@ -465,7 +465,7 @@ class MEt3R(Module):
             closest_z = zbuf[..., 0]
             # ood_depth - gt_depth_from_ood_pose
             diff = (closest_z[:, 0, ...] - closest_z[:, 1, ...]).abs()
-            mask = (~(diff > 5.0) * (closest_z != -1).prod(1)) * mask
+            mask = (~(diff > 0.5) * (closest_z != -1).prod(1)) * mask
 
         # Get feature dissimilarity score map
         feat_dissim_maps = 1 - (rendering[:, 1, ...] * rendering[:, 0, ...]).sum(-1) / (torch.linalg.norm(rendering[:, 1, ...], dim=-1) * torch.linalg.norm(rendering[:, 0, ...], dim=-1) + 1e-3)
