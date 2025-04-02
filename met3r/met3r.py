@@ -112,8 +112,8 @@ class MEt3R(Module):
         view2 = {'img': images[:, 1, ...], 'instance': ['']}
         pred1, pred2 = self.dust3r(view1, view2)
 
-        ptmps = torch.stack([pred1['pts3d'], pred2['pts3d_in_other_view']], dim=1).detach()
-        conf = torch.stack([pred1['conf'], pred2['conf']], dim=1).detach()
+        ptmps = torch.stack([pred1['pts3d'], pred2['pts3d_in_other_view']], dim=1)
+        conf = torch.stack([pred1['conf'], pred2['conf']], dim=1)
 
         # NOTE: Get canonical point map using the confidences
         confs11 = conf.unsqueeze(-1) - 0.999
@@ -312,12 +312,11 @@ class MEt3R(Module):
         self.__init_rasterizer(h, w, **kwargs)
         
         ptmps = self.__ptmps_from_depth(train_depth, ood_depth, K, train_pose, ood_pose)
-        pp = torch.tensor([[K[0, 2], K[1, 2]]], device=ptmps.device)
-        pixels = xy_grid(w, h, device=ptmps.device).view(1, -1, 2) - pp.view(-1, 1, 2)  # B,HW,2
+        pp = torch.stack([K[0, 2], K[1, 2]], dim=0).unsqueeze(0)
     
-        focal = torch.tensor([
-            [K[0, 0], K[1, 1]],
-            [K[0, 0], K[1, 1]]
+        focal = torch.stack([
+            K[0, 0].repeat(1, 2),
+            K[1, 1].repeat(1, 2)
         ]).to(dtype=torch.float32, device=ptmps.device)
 
         images = rearrange(images, 'b k c h w -> (b k) c h w', k=k, c=c)
@@ -481,14 +480,12 @@ class MEt3R(Module):
         # PAVLE
         # Check if any of the feat_dissim_maps values are NaN or Inf
         assert not (torch.isnan(feat_dissim_maps).any() or torch.isinf(feat_dissim_maps).any()), "NAN or Inf in feat_dissim_maps"
-            
-        if mask.sum() == 0:
-            print("--------------------------------")
-            print("Mask is all zeros")
-            print("--------------------------------")
-            
+
         # Weight feature dissimilarity score map with computed mask
-        feat_dissim_weighted = (feat_dissim_maps * mask).sum(-1).sum(-1) / (mask.sum(-1).sum(-1) + 1e-6)
+        if mask.sum() == 0:
+            feat_dissim_weighted = torch.zeros_like(feat_dissim_maps)
+        else:
+            feat_dissim_weighted = (feat_dissim_maps * mask).sum(-1).sum(-1) / (mask.sum(-1).sum(-1) + 1e-5)
 
         outputs = [feat_dissim_weighted]
         if return_overlap_mask:
