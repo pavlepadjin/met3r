@@ -315,9 +315,9 @@ class MEt3R(Module):
         pp = torch.stack([K[0, 2], K[1, 2]], dim=0).unsqueeze(0)
     
         focal = torch.stack([
-            K[0, 0].repeat(1, 2),
-            K[1, 1].repeat(1, 2)
-        ]).to(dtype=torch.float32, device=ptmps.device)
+            K[0, 0].repeat(2),
+            K[1, 1].repeat(2)
+        ]).T.to(dtype=torch.float32, device=ptmps.device)
 
         images = rearrange(images, 'b k c h w -> (b k) c h w', k=k, c=c)
         images = (images + 1) / 2
@@ -459,6 +459,8 @@ class MEt3R(Module):
         # Compute overlapping mask
         non_overlap_mask = (rendering == -10000)
         overlap_mask = (1 - non_overlap_mask.float()).prod(-1).prod(1)
+        overlap_mask = torch.nan_to_num(overlap_mask, nan=0.0)
+        overlap_mask = torch.clamp(overlap_mask, min=0.0, max=1.0)
 
         # Zero out regions which do not overlap
         rendering[non_overlap_mask] = 0.0
@@ -476,17 +478,21 @@ class MEt3R(Module):
 
         # Get feature dissimilarity score map
         feat_dissim_maps = 1 - (rendering[:, 1, ...] * rendering[:, 0, ...]).sum(-1) / (torch.linalg.norm(rendering[:, 1, ...], dim=-1) * torch.linalg.norm(rendering[:, 0, ...], dim=-1) + 1e-3)
-        
+        print(f"--------------------------------")
+        print(f"FEATURE MAX: {feat_dissim_maps.max()}")
+        print(f"FEATURE MIN: {feat_dissim_maps.min()}")
         # PAVLE
         # Check if any of the feat_dissim_maps values are NaN or Inf
         assert not (torch.isnan(feat_dissim_maps).any() or torch.isinf(feat_dissim_maps).any()), "NAN or Inf in feat_dissim_maps"
+
+        feat_dissim_maps = torch.clamp(feat_dissim_maps, min=0.0, max=1.0)
 
         # Weight feature dissimilarity score map with computed mask
         if mask.max() < 1e-5:
             feat_dissim_weighted = torch.zeros_like(feat_dissim_maps)
         else:
             feat_dissim_weighted = (feat_dissim_maps * mask).sum(-1).sum(-1) / (mask.sum(-1).sum(-1) + 1e-5)
-
+            
         outputs = [feat_dissim_weighted]
         if return_overlap_mask:
             outputs.append(mask)
