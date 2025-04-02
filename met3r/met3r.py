@@ -449,6 +449,14 @@ class MEt3R(Module):
         else:
             rendering, zbuf, ptmps = self.dust3r_forward(train_rgb, ood_rgb, **kwargs)
 
+        # PAVLE
+        # Check if any of the rendering values are NaN or Inf
+        assert not (torch.isnan(rendering).any() or torch.isinf(rendering).any()), "NAN or Inf in rendering"
+            
+        assert not (torch.isnan(zbuf).any() or torch.isinf(zbuf).any()), "NAN or Inf in zbuf"
+            
+        assert not (torch.isnan(ptmps).any() or torch.isinf(ptmps).any()), "NAN or Inf in ptmps"
+            
         # Compute overlapping mask
         non_overlap_mask = (rendering == -10000)
         overlap_mask = (1 - non_overlap_mask.float()).prod(-1).prod(1)
@@ -469,6 +477,16 @@ class MEt3R(Module):
 
         # Get feature dissimilarity score map
         feat_dissim_maps = 1 - (rendering[:, 1, ...] * rendering[:, 0, ...]).sum(-1) / (torch.linalg.norm(rendering[:, 1, ...], dim=-1) * torch.linalg.norm(rendering[:, 0, ...], dim=-1) + 1e-3)
+        
+        # PAVLE
+        # Check if any of the feat_dissim_maps values are NaN or Inf
+        assert not (torch.isnan(feat_dissim_maps).any() or torch.isinf(feat_dissim_maps).any()), "NAN or Inf in feat_dissim_maps"
+            
+        if mask.sum() == 0:
+            print("--------------------------------")
+            print("Mask is all zeros")
+            print("--------------------------------")
+            
         # Weight feature dissimilarity score map with computed mask
         feat_dissim_weighted = (feat_dissim_maps * mask).sum(-1).sum(-1) / (mask.sum(-1).sum(-1) + 1e-6)
 
