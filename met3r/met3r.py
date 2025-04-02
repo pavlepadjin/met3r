@@ -55,7 +55,7 @@ class MEt3R(Module):
 
     def __init__(
         self, 
-        img_size: int | None = 256, 
+        img_size: int | None = None, 
         use_norm: bool = True,
         feat_backbone: str = 'dino16',
         featup_weights: str | Path = 'mhamilton723/FeatUp',
@@ -482,7 +482,7 @@ class MEt3R(Module):
         assert not (torch.isnan(feat_dissim_maps).any() or torch.isinf(feat_dissim_maps).any()), "NAN or Inf in feat_dissim_maps"
 
         # Weight feature dissimilarity score map with computed mask
-        if mask.sum() == 0:
+        if mask.max() < 1e-5:
             feat_dissim_weighted = torch.zeros_like(feat_dissim_maps)
         else:
             feat_dissim_weighted = (feat_dissim_maps * mask).sum(-1).sum(-1) / (mask.sum(-1).sum(-1) + 1e-5)
