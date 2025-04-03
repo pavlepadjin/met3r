@@ -270,7 +270,7 @@ class MEt3R(Module):
             zbuf (Float[Tensor, "b k h w n"]): Z-buffers for points per pixel
         """
         with torch.autocast('cuda', enabled=False):
-            fragments = self.rasterizer(point_clouds, **kwargs)
+            fragments = self.rasterizer(point_clouds, eps=1e-4, **kwargs)
 
         r = self.rasterizer.raster_settings.radius
 
@@ -435,8 +435,6 @@ class MEt3R(Module):
             feat_dissim_maps (bool[Tensor, "b h w"], optional): Feature dissimilarity score map
             proj_feats (bool[Tensor, "b h w c"], optional): Projected and rendered features
         """
-        
-
         if K is not None or train_pose is not None or train_depth is not None:
             assert K is not None and train_pose is not None and train_depth is not None, \
                 'K, pose, and depth_map must be provided together'
@@ -448,14 +446,6 @@ class MEt3R(Module):
         else:
             rendering, zbuf, ptmps = self.dust3r_forward(train_rgb, ood_rgb, **kwargs)
 
-        # PAVLE
-        # Check if any of the rendering values are NaN or Inf
-        assert not (torch.isnan(rendering).any() or torch.isinf(rendering).any()), "NAN or Inf in rendering"
-            
-        assert not (torch.isnan(zbuf).any() or torch.isinf(zbuf).any()), "NAN or Inf in zbuf"
-            
-        assert not (torch.isnan(ptmps).any() or torch.isinf(ptmps).any()), "NAN or Inf in ptmps"
-            
         # Compute overlapping mask
         non_overlap_mask = (rendering == -10000)
         overlap_mask = (1 - non_overlap_mask.float()).prod(-1).prod(1)
@@ -478,20 +468,10 @@ class MEt3R(Module):
 
         # Get feature dissimilarity score map
         feat_dissim_maps = 1 - (rendering[:, 1, ...] * rendering[:, 0, ...]).sum(-1) / (torch.linalg.norm(rendering[:, 1, ...], dim=-1) * torch.linalg.norm(rendering[:, 0, ...], dim=-1) + 1e-3)
-        print(f"--------------------------------")
-        print(f"FEATURE MAX: {feat_dissim_maps.max()}")
-        print(f"FEATURE MIN: {feat_dissim_maps.min()}")
-        # PAVLE
-        # Check if any of the feat_dissim_maps values are NaN or Inf
-        assert not (torch.isnan(feat_dissim_maps).any() or torch.isinf(feat_dissim_maps).any()), "NAN or Inf in feat_dissim_maps"
 
         feat_dissim_maps = torch.clamp(feat_dissim_maps, min=0.0, max=1.0)
 
-        # Weight feature dissimilarity score map with computed mask
-        if mask.max() < 1e-5:
-            feat_dissim_weighted = torch.zeros_like(feat_dissim_maps)
-        else:
-            feat_dissim_weighted = (feat_dissim_maps * mask).sum(-1).sum(-1) / (mask.sum(-1).sum(-1) + 1e-5)
+        feat_dissim_weighted = (feat_dissim_maps * mask).sum(-1).sum(-1) / (mask.sum(-1).sum(-1) + 1e-5)
             
         outputs = [feat_dissim_weighted]
         if return_overlap_mask:
