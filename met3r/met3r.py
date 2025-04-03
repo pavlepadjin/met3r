@@ -398,7 +398,6 @@ class MEt3R(Module):
 
         return rendering, zbuf, ptmps
 
-
     def forward(
         self,
         train_rgb: Float[Tensor, 'b 3 h w'],
@@ -458,7 +457,6 @@ class MEt3R(Module):
         # Mask for weighted sum
         mask = overlap_mask
         
-        # NOTE: Uncomment for incorporating occlusion masks along with overlap mask
         if use_oclusion_mask:
             zbuf = rearrange(zbuf, "(b k) ... -> b k ...",  b=1, k=2)
             closest_z = zbuf[..., 0]
