@@ -448,7 +448,6 @@ class MEt3R(Module):
         # Compute overlapping mask
         non_overlap_mask = (rendering == -10000)
         overlap_mask = (1 - non_overlap_mask.float()).prod(-1).prod(1)
-        overlap_mask = torch.nan_to_num(overlap_mask, nan=0.0)
         overlap_mask = torch.clamp(overlap_mask, min=0.0, max=1.0)
 
         # Zero out regions which do not overlap
@@ -485,3 +484,62 @@ class MEt3R(Module):
             outputs.append(ptmps)
 
         return (*outputs, )
+    
+    def forward_rgb_features(
+        self,
+        train_rgb: Float[Tensor, 'b 3 h w'],
+        ood_rgb: Float[Tensor, 'b 3 h w'],
+        return_overlap_mask: bool = False,
+        return_score_map: bool = False,
+        return_projections: bool = False,
+        train_depth: Float[Tensor, 'b h w'] | None = None,
+        ood_depth: Float[Tensor, 'b h w'] | None = None,
+        K: Float[Tensor, 'b 3 3'] | None = None,
+        train_pose: Float[Tensor, 'b 4 4'] | None = None,
+        ood_pose: Float[Tensor, 'b 4 4'] | None = None,
+        return_ptmps: bool = False,
+        use_oclusion_mask: bool = True,
+        **kwargs
+    ):
+        """
+        Essentially used to get the multi-view consistency loss.
+        """
+        if K is not None or train_pose is not None or train_depth is not None:
+            assert K is not None and train_pose is not None and train_depth is not None, \
+                'K, pose, and depth_map must be provided together'
+
+        rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, ood_depth, K, train_pose, ood_pose, use_rgb_as_features=True, **kwargs)
+
+        # Compute overlapping mask
+        non_overlap_mask = (rendering == -10000)
+        overlap_mask = (1 - non_overlap_mask.float()).prod(-1).prod(1)
+        overlap_mask = torch.clamp(overlap_mask, min=0.0, max=1.0)
+
+        # Zero out regions which do not overlap
+        rendering[non_overlap_mask] = 0.0
+
+        # Mask for weighted sum
+        mask = overlap_mask
+        
+        if use_oclusion_mask:
+            zbuf = rearrange(zbuf, "(b k) ... -> b k ...",  b=1, k=2)
+            closest_z = zbuf[..., 0]
+            # ood_depth - gt_depth_from_ood_pose
+            diff = (closest_z[:, 0, ...] - closest_z[:, 1, ...]).abs()
+            mask = (~(diff > 0.5) * (closest_z != -1).prod(1)) * mask
+
+        l1_loss_map = ((rendering[:, 1, ...] - rendering[:, 0, ...])).abs()
+        l1_loss_map *= mask.unsqueeze(-1)
+
+        outputs = [l1_loss_map]
+        if return_overlap_mask:
+            outputs.append(mask)
+
+        if return_projections:
+            outputs.append(rendering)
+
+        if return_ptmps:
+            outputs.append(ptmps)
+
+        return (*outputs, )
+    
