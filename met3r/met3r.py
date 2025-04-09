@@ -284,7 +284,7 @@ class MEt3R(Module):
             weights,
             point_clouds.features_packed().permute(1, 0),
             **kwargs,
-        )
+            )
 
         # permute so image comes at the end
         images = images.permute(0, 2, 3, 1)
@@ -328,9 +328,10 @@ class MEt3R(Module):
         if use_rgb_as_features:
             hr_feat = images.reshape(k, 3, h* w).permute(0, 2, 1)
         elif self.use_featup:
-            hr_feat = self.upsampler(norm(images))
-            hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='bilinear')
-            hr_feat = rearrange(hr_feat, '... c h w -> ... (h w) c')
+            with torch.autocast('cuda', enabled=True):
+                hr_feat = self.upsampler(norm(images))
+                hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='bilinear')
+                hr_feat = rearrange(hr_feat, '... c h w -> ... (h w) c')
             
         ptmps = rearrange(ptmps, 'b k h w c -> (b k) (h w) c', b=b, k=2)
         point_cloud = Pointclouds(points=ptmps, features=hr_feat)
@@ -339,7 +340,7 @@ class MEt3R(Module):
         image_size = torch.tensor([[h, w]])
         cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal, principal_point=pp, in_ndc=False, image_size=image_size)
         
-        with torch.autocast('cuda', enabled=False):
+        with torch.autocast('cuda', enabled=True):
             rendering, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
         rendering = rearrange(rendering, '(b k) ... -> b k ...',  b=b, k=2)
         return rendering, zbuf, ptmps
