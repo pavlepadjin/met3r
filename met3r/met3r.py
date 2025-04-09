@@ -215,21 +215,15 @@ class MEt3R(Module):
         points = points[:, :3]  # [N, 3]
         return points.reshape(pointmap.shape[0], pointmap.shape[1], pointmap.shape[2], 3)  # [B==1, H, W, 3]
 
-    def __ptmps_from_depth(self, train_depth, ood_depth, K, train_pose, ood_pose):
-        h, w = train_depth.shape[-2:]
-
+    def __train_ptmp_from_depth(self, train_depth, K, train_pose, ood_pose):
         rel_pose = self._get_relative_pose(train_pose, ood_pose)
 
-        # use the relative pose to get the point map for the ood image
-        ptmps = torch.zeros(train_depth.shape[0], 2, h, w, 3).to(train_depth.device)
         camera_matrix = torch.eye(4).to(train_depth.device)
         camera_matrix[:3, :3] = K
-        ptmps[:, 0, ...] = self.depth_to_pointmap(ood_depth.squeeze(), camera_matrix)
-        ptmps[:, 1, ...] = self.depth_to_pointmap(train_depth.squeeze(), camera_matrix)
+        ptmp = self.depth_to_pointmap(train_depth.squeeze(), camera_matrix).unsqueeze(0)
+        ptmp = self.transform_pointmap(ptmp, rel_pose)
 
-        ptmps[:, 1, ...] = self.transform_pointmap(ptmps[:, 1, ...], rel_pose)
-
-        return ptmps
+        return ptmp
     
     def __init_rasterizer(self, h, w, points_per_pixel=10, radius=0.01, bin_size=0, max_points_per_bin=None, **kwargs):
         """A helper method to initialize the rasterizer.
@@ -244,17 +238,27 @@ class MEt3R(Module):
         self.rasterizer = PointsRasterizer(cameras=None, raster_settings=raster_settings)
         
     
-    def __get_rt_pytorch3d(self, device="cuda"):
-        """Get the default rotation and translation matrices for Pytorch3D
+    def __get_rt_pytorch3d(self, device="cuda", repeat_factor=2):
+        """
+        Get the default rotation and translation matrices for Pytorch3D
         """
         R = torch.eye(3)
         R[0, 0] *= -1
         R[1, 1] *= -1
-        R = repeat(R, '... -> (b k) ...', b=1, k=2)
+        R = repeat(R, '... -> (b k) ...', b=1, k=repeat_factor)
         T = torch.zeros(3,)
-        T = repeat(T, '... -> (b k) ...', b=1, k=2)
+        T = repeat(T, '... -> (b k) ...', b=1, k=repeat_factor)
         return R.to(device), T.to(device)
-        
+    
+    def __get_oclusion_mask(self, zbuf: torch.Tensor, ood_depth: torch.Tensor, use_depth: bool):
+        zbuf = zbuf if use_depth else rearrange(zbuf, "(b k) ... -> b k ...",  b=1, k=2)
+        closest_z = zbuf[..., 0]
+        closest_z = torch.stack([ood_depth, closest_z], dim=1) if use_depth else closest_z
+        # ood_depth - gt_depth_from_ood_pose
+        diff = (closest_z[:, 0, ...] - closest_z[:, 1, ...]).abs()
+        mask = (~(diff > 0.5) * (closest_z[:,1, ...] != -1).prod(1))
+        return mask
+    
     def render(
         self,
         point_clouds: Pointclouds,
@@ -315,13 +319,13 @@ class MEt3R(Module):
         b, k, c = 1, 2, 3
         self.__init_rasterizer(h, w, **kwargs)
         
-        ptmps = self.__ptmps_from_depth(train_depth, ood_depth, K, train_pose, ood_pose)
+        train_ptmp = self.__train_ptmp_from_depth(train_depth, K, train_pose, ood_pose)
         pp = torch.stack([K[0, 2], K[1, 2]], dim=0).unsqueeze(0)
     
-        focal = torch.stack([
-            K[0, 0].repeat(2),
-            K[1, 1].repeat(2)
-        ]).T.to(dtype=torch.float32, device=ptmps.device)
+        focal = torch.tensor([
+            [K[0, 0],
+            K[1, 1]]
+        ]).to(dtype=torch.float32, device=train_ptmp.device)
 
         images = rearrange(images, 'b k c h w -> (b k) c h w', k=k, c=c)
         images = (images + 1) / 2
@@ -333,18 +337,23 @@ class MEt3R(Module):
                 hr_feat = self.upsampler(norm(images))
                 hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='bilinear')
                 hr_feat = rearrange(hr_feat, '... c h w -> ... (h w) c')
-            
-        ptmps = rearrange(ptmps, 'b k h w c -> (b k) (h w) c', b=b, k=2)
-        point_cloud = Pointclouds(points=ptmps, features=hr_feat)
-            
-        R, T = self.__get_rt_pytorch3d(device=ptmps.device)
+
+        ood_feat, gt_feat = torch.unbind(hr_feat, dim=0)
+        ood_feat = ood_feat.reshape(1, h, w, ood_feat.shape[-1])
+        gt_feat = gt_feat.unsqueeze(0)
+
+        train_ptmp = train_ptmp.reshape(train_ptmp.shape[0], -1, 3) # [B, H*W, 3]
+        point_cloud = Pointclouds(points=train_ptmp, features=gt_feat)
+        R, T = self.__get_rt_pytorch3d(device=train_ptmp.device, repeat_factor=1)
         image_size = torch.tensor([[h, w]])
-        cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal, principal_point=pp, in_ndc=False, image_size=image_size)
+        
+        cameras = PerspectiveCameras(device=train_ptmp.device, R=R, T=T, focal_length=focal, principal_point=pp, in_ndc=False, image_size=image_size)
         
         with torch.autocast('cuda', enabled=enable_mixed_precision):
-            rendering, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
-        rendering = rearrange(rendering, '(b k) ... -> b k ...',  b=b, k=2)
-        return rendering, zbuf, ptmps
+            gt_render, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
+            rendering = torch.cat([ood_feat, gt_render], dim=0)
+            
+        return rendering.unsqueeze(0), zbuf, train_ptmp
     
     def dust3r_forward(self, train_rgb, ood_rgb, **kwargs):
         """
@@ -458,16 +467,10 @@ class MEt3R(Module):
 
         # Zero out regions which do not overlap
         rendering[non_overlap_mask] = 0.0
-
         # Mask for weighted sum
         mask = overlap_mask
         
-        if use_oclusion_mask:
-            zbuf = rearrange(zbuf, "(b k) ... -> b k ...",  b=1, k=2)
-            closest_z = zbuf[..., 0]
-            # ood_depth - gt_depth_from_ood_pose
-            diff = (closest_z[:, 0, ...] - closest_z[:, 1, ...]).abs()
-            mask = (~(diff > 0.5) * (closest_z != -1).prod(1)) * mask
+        mask = self.__get_oclusion_mask(zbuf, ood_depth, use_depth) * mask if use_oclusion_mask else mask
 
         # Get feature dissimilarity score map
         feat_dissim_maps = 1 - (rendering[:, 1, ...] * rendering[:, 0, ...]).sum(-1) / (torch.linalg.norm(rendering[:, 1, ...], dim=-1) * torch.linalg.norm(rendering[:, 0, ...], dim=-1) + 1e-3)
@@ -527,12 +530,7 @@ class MEt3R(Module):
         # Mask for weighted sum
         mask = overlap_mask
         
-        if use_oclusion_mask:
-            zbuf = rearrange(zbuf, "(b k) ... -> b k ...",  b=1, k=2)
-            closest_z = zbuf[..., 0]
-            # ood_depth - gt_depth_from_ood_pose
-            diff = (closest_z[:, 0, ...] - closest_z[:, 1, ...]).abs()
-            mask = (~(diff > 0.5) * (closest_z != -1).prod(1)) * mask
+        mask = self.__get_oclusion_mask(zbuf, ood_depth, True) * mask if use_oclusion_mask else mask
 
         l1_loss_map = ((rendering[:, 1, ...] - rendering[:, 0, ...])).abs()
         l1_loss_map *= mask.unsqueeze(-1)
