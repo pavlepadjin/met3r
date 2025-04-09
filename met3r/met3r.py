@@ -301,6 +301,7 @@ class MEt3R(Module):
         train_pose: Float[Tensor, 'b 4 4'],
         ood_pose: Float[Tensor, 'b 4 4'],
         use_rgb_as_features: bool = False,
+        enable_mixed_precision: bool = True,
         **kwargs
         ) -> Tuple[Float[Tensor, 'b h w'], Float[Tensor, 'b 2 h w 3']]:
         """
@@ -328,7 +329,7 @@ class MEt3R(Module):
         if use_rgb_as_features:
             hr_feat = images.reshape(k, 3, h* w).permute(0, 2, 1)
         elif self.use_featup:
-            with torch.autocast('cuda', enabled=True):
+            with torch.autocast('cuda', enabled=enable_mixed_precision):
                 hr_feat = self.upsampler(norm(images))
                 hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='bilinear')
                 hr_feat = rearrange(hr_feat, '... c h w -> ... (h w) c')
@@ -340,7 +341,7 @@ class MEt3R(Module):
         image_size = torch.tensor([[h, w]])
         cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal, principal_point=pp, in_ndc=False, image_size=image_size)
         
-        with torch.autocast('cuda', enabled=True):
+        with torch.autocast('cuda', enabled=enable_mixed_precision):
             rendering, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
         rendering = rearrange(rendering, '(b k) ... -> b k ...',  b=b, k=2)
         return rendering, zbuf, ptmps
@@ -417,6 +418,7 @@ class MEt3R(Module):
         use_rgb_as_features: bool = False,
         return_ptmps: bool = False,
         use_oclusion_mask: bool = True,
+        enable_mixed_precision: bool = True,
         **kwargs
     ) -> Tuple[
             float,
@@ -445,7 +447,7 @@ class MEt3R(Module):
         use_depth = train_depth is not None
         
         if use_depth:
-            rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, ood_depth, K, train_pose, ood_pose, use_rgb_as_features, **kwargs)
+            rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, ood_depth, K, train_pose, ood_pose, use_rgb_as_features, enable_mixed_precision, **kwargs)
         else:
             rendering, zbuf, ptmps = self.dust3r_forward(train_rgb, ood_rgb, **kwargs)
 
