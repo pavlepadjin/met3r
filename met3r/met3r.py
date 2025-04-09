@@ -64,6 +64,7 @@ class MEt3R(Module):
         use_mast3r_features: bool = False,
         use_featup: bool = True,
         use_dust3r_features: bool = False,
+        use_depth_pointmaps: bool = True,
         **kwargs
     ) -> None:
         """Initialize MET3R
@@ -85,21 +86,23 @@ class MEt3R(Module):
         self.use_mast3r_features = use_mast3r_features
         self.use_dust3r_features = use_dust3r_features
         self.use_featup = use_featup
-        if use_mast3r_dust3r:
-            # Load MASt3R
-            from mast3r.model import AsymmetricMASt3R
-            self.dust3r = AsymmetricMASt3R.from_pretrained(dust3r_weights)
-        else:
-            # Load DUSt3R model
-            from dust3r.model import AsymmetricCroCo3DStereo
-            self.dust3r = AsymmetricCroCo3DStereo.from_pretrained(dust3r_weights)
+        if not use_depth_pointmaps:
+            if use_mast3r_dust3r:
+                # Load MASt3R
+                from mast3r.model import AsymmetricMASt3R
+                self.dust3r = AsymmetricMASt3R.from_pretrained(dust3r_weights)
+            else:
+                # Load DUSt3R model
+                from dust3r.model import AsymmetricCroCo3DStereo
+                self.dust3r = AsymmetricCroCo3DStereo.from_pretrained(dust3r_weights)
+                
+            freeze(self.dust3r)
 
         if self.img_size is not None:
             self.__init_rasterizer(img_size, img_size, **kwargs)
             
         self.compositor = AlphaCompositor()
 
-        freeze(self.dust3r)
         freeze(self.upsampler)
 
     def _compute_canonical_point_map(
@@ -126,7 +129,7 @@ class MEt3R(Module):
     @staticmethod
     def depth_to_pointmap(
         depth_map: torch.Tensor,
-        camera_matrix: torch.Tensor) -> PointCloud:
+        camera_matrix: torch.Tensor) -> torch.Tensor:
         """
         Creates PointCloud object given the depth map and camera intrinsics.
         Optional RGB colors, camera pose and normals are supported.
@@ -183,7 +186,7 @@ class MEt3R(Module):
         # Remove homogenous coordinate
         pointmap = points_3d[:, :, :3]
 
-        return pointmap
+        return pointmap # [H, W, 3]
 
     def _get_relative_pose(self, train_pose, ood_pose):
         """A relative transformation from train to ood camera coordinate system
