@@ -224,7 +224,7 @@ class MEt3R(Module):
         ptmp = self.transform_pointmap(ptmp, rel_pose)
 
         return ptmp
-    
+
     def __init_rasterizer(self, h, w, points_per_pixel=10, radius=0.01, bin_size=0, max_points_per_bin=None, **kwargs):
         """A helper method to initialize the rasterizer.
         """
@@ -250,13 +250,11 @@ class MEt3R(Module):
         T = repeat(T, '... -> (b k) ...', b=1, k=repeat_factor)
         return R.to(device), T.to(device)
     
-    def __get_oclusion_mask(self, zbuf: torch.Tensor, ood_depth: torch.Tensor, use_depth: bool):
-        zbuf = zbuf if use_depth else rearrange(zbuf, "(b k) ... -> b k ...",  b=1, k=2)
+    def __get_oclusion_mask_with_depth(self, zbuf: torch.Tensor, ood_depth: torch.Tensor):
         closest_z = zbuf[..., 0]
-        closest_z = torch.stack([ood_depth, closest_z], dim=1) if use_depth else closest_z
         # ood_depth - gt_depth_from_ood_pose
-        diff = (closest_z[:, 0, ...] - closest_z[:, 1, ...]).abs()
-        mask = (~(diff > 0.5) * (closest_z[:,1, ...] != -1).prod(1))
+        diff = (ood_depth - closest_z).abs()
+        mask = (~(diff > 0.5) * (closest_z != -1))
         return mask
     
     def render(
@@ -467,21 +465,20 @@ class MEt3R(Module):
 
         # Zero out regions which do not overlap
         rendering[non_overlap_mask] = 0.0
-        # Mask for weighted sum
-        mask = overlap_mask
-        
-        mask = self.__get_oclusion_mask(zbuf, ood_depth, use_depth) * mask if use_oclusion_mask else mask
+
+        overlap_mask = self.__get_oclusion_mask_with_depth(zbuf, ood_depth) * overlap_mask if use_oclusion_mask else overlap_mask
 
         # Get feature dissimilarity score map
         feat_dissim_maps = 1 - (rendering[:, 1, ...] * rendering[:, 0, ...]).sum(-1) / (torch.linalg.norm(rendering[:, 1, ...], dim=-1) * torch.linalg.norm(rendering[:, 0, ...], dim=-1) + 1e-3)
 
         feat_dissim_maps = torch.clamp(feat_dissim_maps, min=0.0, max=1.0)
+        feat_dissim_maps *= overlap_mask
 
-        feat_dissim_weighted = (feat_dissim_maps * mask).sum(-1).sum(-1) / (mask.sum(-1).sum(-1) + 1e-5)
+        feat_dissim_weighted = (feat_dissim_maps * overlap_mask).sum(-1).sum(-1) / (overlap_mask.sum(-1).sum(-1) + 1e-5)
             
         outputs = [feat_dissim_weighted]
         if return_overlap_mask:
-            outputs.append(mask)
+            outputs.append(overlap_mask)
 
         if return_score_map:
             outputs.append(feat_dissim_maps)
@@ -526,18 +523,14 @@ class MEt3R(Module):
 
         # Zero out regions which do not overlap
         rendering[non_overlap_mask] = 0.0
-
-        # Mask for weighted sum
-        mask = overlap_mask
-        
-        mask = self.__get_oclusion_mask(zbuf, ood_depth, True) * mask if use_oclusion_mask else mask
+        overlap_mask = self.__get_oclusion_mask_with_depth(zbuf, ood_depth) * overlap_mask if use_oclusion_mask else overlap_mask
 
         l1_loss_map = ((rendering[:, 1, ...] - rendering[:, 0, ...])).abs()
-        l1_loss_map *= mask.unsqueeze(-1)
+        l1_loss_map *= overlap_mask.unsqueeze(-1)
 
         outputs = [l1_loss_map]
         if return_overlap_mask:
-            outputs.append(mask)
+            outputs.append(overlap_mask)
 
         if return_projections:
             outputs.append(rendering)
