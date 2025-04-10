@@ -131,8 +131,7 @@ class MEt3R(Module):
         depth_map: torch.Tensor,
         camera_matrix: torch.Tensor) -> torch.Tensor:
         """
-        Creates PointCloud object given the depth map and camera intrinsics.
-        Optional RGB colors, camera pose and normals are supported.
+        Creates pointmap matrix given the depth map and camera intrinsics.
 
         Args:
             depth_map: Depth map of shape [<height>, <width>] or [<height>, <width>, 1].
@@ -142,7 +141,7 @@ class MEt3R(Module):
                 and [height, width, 3] if RGB image.
             camera_pose: Optional camera extrinsics matrix of shape [4, 4].
         Rets:
-            PointCloud object created from the given data.
+            pointmap: pointmap matrix of shape [H, W, 3]
         """
         # Validate depth map
         assert depth_map.dim() in [2, 3]
@@ -189,11 +188,13 @@ class MEt3R(Module):
         return pointmap # [H, W, 3]
 
     def _get_relative_pose(self, train_pose, ood_pose):
-        """A relative transformation from train to ood camera coordinate system
-
+        """
+        A relative transformation from train to ood camera coordinate system.
+        Args:
+            train_pose: 4x4 train camera pose matrix
+            ood_pose: 4x4 ood camera pose matrix
         Returns:
-            Rt_rel: relative rotation matrix
-            tt_rel: relative translation vector
+            4x4 relative pose matrix
         """
         assert train_pose.shape == (4, 4)
         assert ood_pose.shape == (4, 4)
@@ -201,8 +202,14 @@ class MEt3R(Module):
         rel_pose = ood_pose @ train_pose_inv
         return rel_pose
 
-    def transform_pointmap(self, pointmap, pose):
-        """Transform a pointmap using a pose matrix
+    def transform_pointmap(self, pointmap: torch.Tensor, pose: torch.Tensor) -> torch.Tensor:
+        """
+        Transform a pointmap using a pose matrix.
+        Args:
+            pointmap: pointmap matrix of shape [B, H, W, 3]
+            pose: 4x4 pose matrix
+        Returns:
+            4x4 transformed pointmap matrix
         """
         assert pointmap.dim() == 4  # [B==1, H, W, 3]
         assert pointmap.shape[-1] == 3
@@ -216,6 +223,9 @@ class MEt3R(Module):
         return points.reshape(pointmap.shape[0], pointmap.shape[1], pointmap.shape[2], 3)  # [B==1, H, W, 3]
 
     def __train_ptmp_from_depth(self, train_depth, K, train_pose, ood_pose):
+        """
+        Transforms the train depth map to pointmap and then to the ood camera coordinate system.
+        """
         rel_pose = self._get_relative_pose(train_pose, ood_pose)
 
         camera_matrix = torch.eye(4).to(train_depth.device)
@@ -226,7 +236,8 @@ class MEt3R(Module):
         return ptmp
 
     def __init_rasterizer(self, h, w, points_per_pixel=10, radius=0.01, bin_size=0, max_points_per_bin=None, **kwargs):
-        """A helper method to initialize the rasterizer.
+        """
+        A helper method to initialize the rasterizer.
         """
         raster_settings = PointsRasterizationSettings(
             image_size=(h, w),
@@ -298,8 +309,7 @@ class MEt3R(Module):
         train_rgb: Float[Tensor, 'b 3 h w'],
         ood_rgb: Float[Tensor, 'b 3 h w'],
         train_depth: Float[Tensor, 'b h w'],
-        ood_depth: Float[Tensor, 'b h w'],
-        K: Float[Tensor, 'b 3 3'],
+        camera_matrix: Float[Tensor, 'b 3 3'],
         train_pose: Float[Tensor, 'b 4 4'],
         ood_pose: Float[Tensor, 'b 4 4'],
         use_rgb_as_features: bool = False,
@@ -307,8 +317,7 @@ class MEt3R(Module):
         **kwargs
         ) -> Tuple[Float[Tensor, 'b h w'], Float[Tensor, 'b 2 h w 3']]:
         """
-        Forward function to compute MET3R from depth, calibration and poses 
-        instead of dust3r.
+        Forward function to render images from the train depth map, intrinsics and poses.
         """
         images = torch.zeros(1, 2, *train_rgb.shape).to(train_rgb.device)
         images[0, 0] = ood_rgb
@@ -317,12 +326,12 @@ class MEt3R(Module):
         b, k, c = 1, 2, 3
         self.__init_rasterizer(h, w, **kwargs)
         
-        train_ptmp = self.__train_ptmp_from_depth(train_depth, K, train_pose, ood_pose)
-        pp = torch.stack([K[0, 2], K[1, 2]], dim=0).unsqueeze(0)
+        train_ptmp = self.__train_ptmp_from_depth(train_depth, camera_matrix, train_pose, ood_pose)
+        pp = torch.stack([camera_matrix[0, 2], camera_matrix[1, 2]], dim=0).unsqueeze(0)
     
         focal = torch.tensor([
-            [K[0, 0],
-            K[1, 1]]
+            [camera_matrix[0, 0],
+            camera_matrix[1, 1]]
         ]).to(dtype=torch.float32, device=train_ptmp.device)
 
         images = rearrange(images, 'b k c h w -> (b k) c h w', k=k, c=c)
@@ -454,7 +463,7 @@ class MEt3R(Module):
         use_depth = train_depth is not None
         
         if use_depth:
-            rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, ood_depth, K, train_pose, ood_pose, use_rgb_as_features, enable_mixed_precision, **kwargs)
+            rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, K, train_pose, ood_pose, use_rgb_as_features, enable_mixed_precision, **kwargs)
         else:
             rendering, zbuf, ptmps = self.dust3r_forward(train_rgb, ood_rgb, **kwargs)
 
@@ -500,7 +509,7 @@ class MEt3R(Module):
         return_projections: bool = False,
         train_depth: Float[Tensor, 'b h w'] | None = None,
         ood_depth: Float[Tensor, 'b h w'] | None = None,
-        K: Float[Tensor, 'b 3 3'] | None = None,
+        camera_matrix: Float[Tensor, 'b 3 3'] | None = None,
         train_pose: Float[Tensor, 'b 4 4'] | None = None,
         ood_pose: Float[Tensor, 'b 4 4'] | None = None,
         return_ptmps: bool = False,
@@ -508,13 +517,14 @@ class MEt3R(Module):
         **kwargs
     ):
         """
-        Essentially used to get the multi-view consistency loss.
+        Forward function to compute the multi-view consistency loss.
+
         """
-        if K is not None or train_pose is not None or train_depth is not None:
-            assert K is not None and train_pose is not None and train_depth is not None, \
+        if camera_matrix is not None or train_pose is not None or train_depth is not None:
+            assert camera_matrix is not None and train_pose is not None and train_depth is not None, \
                 'K, pose, and depth_map must be provided together'
 
-        rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, ood_depth, K, train_pose, ood_pose, use_rgb_as_features=True, **kwargs)
+        rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, camera_matrix, train_pose, ood_pose, use_rgb_as_features=True, **kwargs)
 
         # Compute overlapping mask
         non_overlap_mask = (rendering == -10000)
