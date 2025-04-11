@@ -428,7 +428,7 @@ class MEt3R(Module):
         return_projections: bool = False,
         train_depth: Float[Tensor, 'b h w'] | None = None,
         ood_depth: Float[Tensor, 'b h w'] | None = None,
-        K: Float[Tensor, 'b 3 3'] | None = None,
+        camera_matrix: Float[Tensor, 'b 3 3'] | None = None,
         train_pose: Float[Tensor, 'b 4 4'] | None = None,
         ood_pose: Float[Tensor, 'b 4 4'] | None = None,
         use_rgb_as_features: bool = False,
@@ -456,14 +456,14 @@ class MEt3R(Module):
             feat_dissim_maps (bool[Tensor, "b h w"], optional): Feature dissimilarity score map
             proj_feats (bool[Tensor, "b h w c"], optional): Projected and rendered features
         """
-        if K is not None or train_pose is not None or train_depth is not None:
-            assert K is not None and train_pose is not None and train_depth is not None, \
-                'K, pose, and depth_map must be provided together'
+        if camera_matrix is not None or train_pose is not None or train_depth is not None:
+            assert camera_matrix is not None and train_pose is not None and train_depth is not None, \
+                'camera matrix, pose, and depth_map must be provided together'
 
         use_depth = train_depth is not None
         
         if use_depth:
-            rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, K, train_pose, ood_pose, use_rgb_as_features, enable_mixed_precision, **kwargs)
+            rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, camera_matrix, train_pose, ood_pose, use_rgb_as_features, enable_mixed_precision, **kwargs)
         else:
             rendering, zbuf, ptmps = self.dust3r_forward(train_rgb, ood_rgb, **kwargs)
 
@@ -522,7 +522,7 @@ class MEt3R(Module):
         """
         if camera_matrix is not None or train_pose is not None or train_depth is not None:
             assert camera_matrix is not None and train_pose is not None and train_depth is not None, \
-                'K, pose, and depth_map must be provided together'
+                'camera matrix, pose, and depth_map must be provided together'
 
         rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, camera_matrix, train_pose, ood_pose, use_rgb_as_features=True, **kwargs)
 
