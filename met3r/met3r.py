@@ -235,7 +235,7 @@ class MEt3R(Module):
 
         return ptmp
 
-    def __init_rasterizer(self, h, w, points_per_pixel=10, radius=0.01, bin_size=32, max_points_per_bin=None, **kwargs):
+    def __init_rasterizer(self, h, w, points_per_pixel=10, radius=0.01, bin_size=64, max_points_per_bin=None, **kwargs):
         """
         A helper method to initialize the rasterizer.
         """
