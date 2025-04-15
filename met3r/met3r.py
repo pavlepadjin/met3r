@@ -76,7 +76,7 @@ class MEt3R(Module):
             featup_weights (str | Path, optional): Weight path for FeatUp upsampler. Defaults to "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric".
             use_mast3r_dust3r (bool, optional): Set to True to use DUSt3R weights from MASt3R. Defaults to True.
             use_mast3r_features (bool, optional): Set to True to use MASt3R features instead of FeatUp. Defaults to False.
-            upsample_features (bool, optional): Set to False to use the native features directly from backbone without featup and instead use nearest neighbor upsampling. Defaults to True.
+            use_featup (bool, optional): Set to False to use the native features directly from backbone without featup and instead use nearest neighbor upsampling. Defaults to True.
         """
         super().__init__()
         self.img_size = img_size
@@ -235,7 +235,7 @@ class MEt3R(Module):
 
         return ptmp
 
-    def __init_rasterizer(self, h, w, points_per_pixel=10, radius=0.01, bin_size=0, max_points_per_bin=None, **kwargs):
+    def __init_rasterizer(self, h, w, points_per_pixel=10, radius=0.01, bin_size=32, max_points_per_bin=None, **kwargs):
         """
         A helper method to initialize the rasterizer.
         """
@@ -268,6 +268,20 @@ class MEt3R(Module):
         mask = (~(diff > 0.5) * (closest_z != -1))
         return mask
     
+    def __extract_features(self, images: torch.Tensor, use_rgb_as_features: bool, enable_mixed_precision: bool):
+        """
+        Script used to extract features from images. Options are to use DINO features or RGB features (when use_rgb_as_features is True).
+        """
+        if use_rgb_as_features:
+            hr_feat = images.reshape(2, 3, -1).permute(0, 2, 1)
+        elif self.use_featup:
+            with torch.autocast('cuda', enabled=enable_mixed_precision):
+                hr_feat = self.upsampler(norm(images))
+                hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='bilinear')
+                hr_feat = hr_feat.reshape(*hr_feat.shape[:-2], hr_feat.shape[-2]*hr_feat.shape[-1]).transpose(-2, -1)
+                
+        return hr_feat
+    
     def render(
         self,
         point_clouds: Pointclouds,
@@ -285,8 +299,7 @@ class MEt3R(Module):
             images (Float[Tensor, "b h w c"]): Rendered images
             zbuf (Float[Tensor, "b k h w n"]): Z-buffers for points per pixel
         """
-        with torch.autocast('cuda', enabled=False):
-            fragments = self.rasterizer(point_clouds, eps=1e-4, **kwargs)
+        fragments = self.rasterizer(point_clouds, eps=1e-4, **kwargs)
 
         r = self.rasterizer.raster_settings.radius
 
@@ -304,7 +317,7 @@ class MEt3R(Module):
 
         return images, fragments.zbuf
     
-    def forward_depth(
+    def reproject_features(
         self,
         train_rgb: Float[Tensor, 'b 3 h w'],
         ood_rgb: Float[Tensor, 'b 3 h w'],
@@ -319,31 +332,24 @@ class MEt3R(Module):
         """
         Forward function to render images from the train depth map, intrinsics and poses.
         """
-        images = torch.zeros(1, 2, *train_rgb.shape).to(train_rgb.device)
+        b = train_rgb.shape[0] if train_rgb.ndim == 4 else 1
+        images = torch.zeros(b, 2, *train_rgb.shape).to(train_rgb.device)
         images[0, 0] = ood_rgb
         images[0, 1] = train_rgb
         *_, h, w = images.shape
-        b, k, c = 1, 2, 3
+        
         self.__init_rasterizer(h, w, **kwargs)
         
         train_ptmp = self.__train_ptmp_from_depth(train_depth, camera_matrix, train_pose, ood_pose)
-        pp = torch.stack([camera_matrix[0, 2], camera_matrix[1, 2]], dim=0).unsqueeze(0)
     
         focal = torch.tensor([
             [camera_matrix[0, 0],
             camera_matrix[1, 1]]
         ]).to(dtype=torch.float32, device=train_ptmp.device)
 
-        images = rearrange(images, 'b k c h w -> (b k) c h w', k=k, c=c)
+        images = images.reshape(images.shape[0]*images.shape[1], *images.shape[2:])
         images = (images + 1) / 2
-        
-        if use_rgb_as_features:
-            hr_feat = images.reshape(k, 3, h* w).permute(0, 2, 1)
-        elif self.use_featup:
-            with torch.autocast('cuda', enabled=enable_mixed_precision):
-                hr_feat = self.upsampler(norm(images))
-                hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='bilinear')
-                hr_feat = rearrange(hr_feat, '... c h w -> ... (h w) c')
+        hr_feat = self.__extract_features(images, use_rgb_as_features, enable_mixed_precision)
 
         ood_feat, gt_feat = torch.unbind(hr_feat, dim=0)
         ood_feat = ood_feat.reshape(1, h, w, ood_feat.shape[-1])
@@ -351,17 +357,45 @@ class MEt3R(Module):
 
         train_ptmp = train_ptmp.reshape(train_ptmp.shape[0], -1, 3) # [B, H*W, 3]
         point_cloud = Pointclouds(points=train_ptmp, features=gt_feat)
+        
         R, T = self.__get_rt_pytorch3d(device=train_ptmp.device, repeat_factor=1)
         image_size = torch.tensor([[h, w]])
-        
+        pp = torch.stack([camera_matrix[0, 2], camera_matrix[1, 2]], dim=0).unsqueeze(0)
         cameras = PerspectiveCameras(device=train_ptmp.device, R=R, T=T, focal_length=focal, principal_point=pp, in_ndc=False, image_size=image_size)
         
-        with torch.autocast('cuda', enabled=enable_mixed_precision):
-            gt_render, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
-            rendering = torch.cat([ood_feat, gt_render], dim=0)
+        gt_render, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
+        rendering = torch.cat([ood_feat, gt_render], dim=0)
             
         return rendering.unsqueeze(0), zbuf, train_ptmp
     
+    def reproject_depth(self, train_depth, camera_matrix, train_pose, ood_pose, enable_mixed_precision: bool = True, **kwargs):
+        """
+        Reproject the train depth map to the ood camera coordinate system.
+        """
+        *_, h, w = train_depth.shape
+        
+        self.__init_rasterizer(h, w, **kwargs)
+        
+        train_ptmp = self.__train_ptmp_from_depth(train_depth, camera_matrix, train_pose, ood_pose)
+    
+        focal = torch.tensor([
+            [camera_matrix[0, 0],
+            camera_matrix[1, 1]]
+        ]).to(dtype=torch.float32, device=train_ptmp.device)
+
+        train_ptmp = train_ptmp.reshape(train_ptmp.shape[0], -1, 3) # [B, H*W, 3]
+        dummy_features = torch.zeros(*train_ptmp.shape[:-1], 1).to(train_ptmp.device)
+        point_cloud = Pointclouds(points=train_ptmp, features=dummy_features)
+        
+        R, T = self.__get_rt_pytorch3d(device=train_ptmp.device, repeat_factor=1)
+        image_size = torch.tensor([[h, w]])
+        pp = torch.stack([camera_matrix[0, 2], camera_matrix[1, 2]], dim=0).unsqueeze(0)
+        cameras = PerspectiveCameras(device=train_ptmp.device, R=R, T=T, focal_length=focal, principal_point=pp, in_ndc=False, image_size=image_size)
+        
+        _, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000])
+            
+        return zbuf
+
     def dust3r_forward(self, train_rgb, ood_rgb, **kwargs):
         """
         Forward function to compute MET3R from dust3r pointmaps.
@@ -413,8 +447,7 @@ class MEt3R(Module):
         focal = repeat(focal, 'b c -> (b k) c', k=2)
         cameras = PerspectiveCameras(device=ptmps.device, R=R, T=T, focal_length=focal)
 
-        with torch.autocast('cuda', enabled=False):
-            rendering, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
+        rendering, zbuf = self.render(point_cloud, cameras=cameras, background_color=[-10000] * hr_feat.shape[-1])
         rendering = rearrange(rendering, '(b k) ... -> b k ...',  b=B, k=2)
 
         return rendering, zbuf, ptmps
@@ -432,7 +465,6 @@ class MEt3R(Module):
         train_pose: Float[Tensor, 'b 4 4'] | None = None,
         ood_pose: Float[Tensor, 'b 4 4'] | None = None,
         use_rgb_as_features: bool = False,
-        return_ptmps: bool = False,
         use_oclusion_mask: bool = True,
         enable_mixed_precision: bool = True,
         **kwargs
@@ -463,7 +495,7 @@ class MEt3R(Module):
         use_depth = train_depth is not None
         
         if use_depth:
-            rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, camera_matrix, train_pose, ood_pose, use_rgb_as_features, enable_mixed_precision, **kwargs)
+            rendering, zbuf, ptmps = self.reproject_features(train_rgb, ood_rgb, train_depth, camera_matrix, train_pose, ood_pose, use_rgb_as_features, enable_mixed_precision, **kwargs)
         else:
             rendering, zbuf, ptmps = self.dust3r_forward(train_rgb, ood_rgb, **kwargs)
 
@@ -495,9 +527,6 @@ class MEt3R(Module):
         if return_projections:
             outputs.append(rendering)
 
-        if return_ptmps:
-            outputs.append(ptmps)
-
         return (*outputs, )
     
     def forward_rgb_features(
@@ -524,7 +553,7 @@ class MEt3R(Module):
             assert camera_matrix is not None and train_pose is not None and train_depth is not None, \
                 'camera matrix, pose, and depth_map must be provided together'
 
-        rendering, zbuf, ptmps = self.forward_depth(train_rgb, ood_rgb, train_depth, camera_matrix, train_pose, ood_pose, use_rgb_as_features=True, **kwargs)
+        rendering, zbuf, ptmps = self.reproject_features(train_rgb, ood_rgb, train_depth, camera_matrix, train_pose, ood_pose, use_rgb_as_features=True, **kwargs)
 
         # Compute overlapping mask
         non_overlap_mask = (rendering == -10000)
@@ -547,6 +576,39 @@ class MEt3R(Module):
 
         if return_ptmps:
             outputs.append(ptmps)
+
+        return (*outputs, )
+    
+    
+    def forward_depth_mvc(
+        self,
+        train_depth: Float[Tensor, 'b h w'],
+        ood_depth: Float[Tensor, 'b h w'],
+        camera_matrix: Float[Tensor, 'b 3 3'],
+        train_pose: Float[Tensor, 'b 4 4'],
+        ood_pose: Float[Tensor, 'b 4 4'],
+        return_overlap_mask: bool = False,
+        use_oclusion_mask: bool = True,
+        **kwargs
+        ):
+        
+        """
+        Forward function to compute the depth multi-view regularization loss.
+        """
+        zbuf = self.reproject_depth(train_depth, camera_matrix, train_pose, ood_pose, **kwargs)
+        reprojected_depth = zbuf[..., 0]
+
+        # Compute overlapping mask
+        non_overlap_mask = (reprojected_depth == -10000)
+        overlap_mask = (1 - non_overlap_mask.float()).prod(-1).prod(1)
+        overlap_mask = torch.clamp(overlap_mask, min=0.0, max=1.0)
+        overlap_mask = self.__get_oclusion_mask_with_depth(zbuf, ood_depth) * overlap_mask if use_oclusion_mask else overlap_mask
+
+        l1_loss_map = ((reprojected_depth - ood_depth)).abs()
+        l1_loss_map = (l1_loss_map * overlap_mask)
+        outputs = [l1_loss_map]
+        if return_overlap_mask:
+            outputs.append(overlap_mask)
 
         return (*outputs, )
     
