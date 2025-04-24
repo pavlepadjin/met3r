@@ -25,10 +25,13 @@ from pytorch3d.renderer import (
     AlphaCompositor,
 )
 from pytorch3d.transforms import Transform3d
+from torch.nn import functional as F
 
 import sys
 import os
 import os.path as path
+
+
 HERE_PATH = os.path.dirname(os.path.abspath(__file__))
 MASt3R_REPO_PATH = path.normpath(path.join(HERE_PATH, '../mast3r'))
 DUSt3R_REPO_PATH = path.normpath(path.join(HERE_PATH, '../mast3r/dust3r'))
@@ -53,11 +56,13 @@ def freeze(m: Module) -> None:
 
 class MEt3R(Module):
 
+
     def __init__(
         self, 
         img_size: int | None = None, 
         use_norm: bool = True,
         feat_backbone: str = 'dino16',
+        patch_size: int = 16,
         featup_weights: str | Path = 'mhamilton723/FeatUp',
         dust3r_weights: str | Path = 'naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric',
         use_mast3r_dust3r: bool = True,
@@ -81,7 +86,7 @@ class MEt3R(Module):
         super().__init__()
         self.img_size = img_size
         self.upsampler = torch.hub.load(featup_weights, feat_backbone, use_norm=use_norm)
-
+        self.patch_size = patch_size
         self.use_mast3r_dust3r = use_mast3r_dust3r
         self.use_mast3r_features = use_mast3r_features
         self.use_dust3r_features = use_dust3r_features
@@ -235,7 +240,7 @@ class MEt3R(Module):
 
         return ptmp
 
-    def __init_rasterizer(self, h, w, points_per_pixel=10, radius=0.01, bin_size=64, max_points_per_bin=None, **kwargs):
+    def __init_rasterizer(self, h, w, points_per_pixel=10, radius=0.01, bin_size=128, max_points_per_bin=None, **kwargs):
         """
         A helper method to initialize the rasterizer.
         """
@@ -268,18 +273,29 @@ class MEt3R(Module):
         mask = (~(diff > 0.5) * (closest_z != -1))
         return mask
     
-    def __extract_features(self, images: torch.Tensor, use_rgb_as_features: bool, enable_mixed_precision: bool):
+    def __extract_features(self, images: torch.Tensor, use_rgb_as_features: bool, enable_mixed_precision: bool, pad = False):
         """
         Script used to extract features from images. Options are to use DINO features or RGB features (when use_rgb_as_features is True).
         """
         if use_rgb_as_features:
             hr_feat = images.reshape(2, 3, -1).permute(0, 2, 1)
         elif self.use_featup:
+            orig_img_h, orig_img_w = images.shape[-2:]
+            if pad:
+                # Calculate padding needed to make dimensions divisible by patch_size
+                pad_h = (self.patch_size - images.shape[-2] % self.patch_size) % self.patch_size
+                pad_w = (self.patch_size - images.shape[-1] % self.patch_size) % self.patch_size
+                # Pad the last two dimensions (height and width)
+                images = F.pad(images, (0, pad_w, 0, pad_h), "constant", 0)
+            
             with torch.autocast('cuda', enabled=enable_mixed_precision):
                 hr_feat = self.upsampler(norm(images))
-                hr_feat = torch.nn.functional.interpolate(hr_feat, (images.shape[-2:]), mode='bilinear')
+                if pad:
+                    hr_feat = hr_feat[..., :orig_img_h, :orig_img_w]
+                hr_feat = torch.nn.functional.interpolate(hr_feat, (orig_img_h, orig_img_w), mode='bilinear')
                 hr_feat = hr_feat.reshape(*hr_feat.shape[:-2], hr_feat.shape[-2]*hr_feat.shape[-1]).transpose(-2, -1)
-                
+        
+        
         return hr_feat
     
     def render(
@@ -327,6 +343,7 @@ class MEt3R(Module):
         ood_pose: Float[Tensor, 'b 4 4'],
         use_rgb_as_features: bool = False,
         enable_mixed_precision: bool = True,
+        pad: bool = False,
         **kwargs
         ) -> Tuple[Float[Tensor, 'b h w'], Float[Tensor, 'b 2 h w 3']]:
         """
@@ -349,7 +366,7 @@ class MEt3R(Module):
 
         images = images.reshape(images.shape[0]*images.shape[1], *images.shape[2:])
         images = (images + 1) / 2
-        hr_feat = self.__extract_features(images, use_rgb_as_features, enable_mixed_precision)
+        hr_feat = self.__extract_features(images, use_rgb_as_features, enable_mixed_precision, pad)
 
         ood_feat, gt_feat = torch.unbind(hr_feat, dim=0)
         ood_feat = ood_feat.reshape(1, h, w, ood_feat.shape[-1])
@@ -467,6 +484,7 @@ class MEt3R(Module):
         use_rgb_as_features: bool = False,
         use_oclusion_mask: bool = True,
         enable_mixed_precision: bool = True,
+        pad: bool = False,
         **kwargs
     ) -> Tuple[
             float,
@@ -495,7 +513,7 @@ class MEt3R(Module):
         use_depth = train_depth is not None
         
         if use_depth:
-            rendering, zbuf, ptmps = self.reproject_features(train_rgb, ood_rgb, train_depth, camera_matrix, train_pose, ood_pose, use_rgb_as_features, enable_mixed_precision, **kwargs)
+            rendering, zbuf, ptmps = self.reproject_features(train_rgb, ood_rgb, train_depth, camera_matrix, train_pose, ood_pose, use_rgb_as_features, enable_mixed_precision, pad, **kwargs)
         else:
             rendering, zbuf, ptmps = self.dust3r_forward(train_rgb, ood_rgb, **kwargs)
 
