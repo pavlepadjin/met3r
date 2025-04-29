@@ -618,7 +618,7 @@ class MEt3R(Module):
 
         # Compute overlapping mask
         non_overlap_mask = (reprojected_depth == -10000)
-        overlap_mask = (1 - non_overlap_mask.float()).prod(-1).prod(1)
+        overlap_mask = (1 - non_overlap_mask.float())
         overlap_mask = torch.clamp(overlap_mask, min=0.0, max=1.0)
         overlap_mask = self.__get_oclusion_mask_with_depth(zbuf, ood_depth) * overlap_mask if use_oclusion_mask else overlap_mask
 
