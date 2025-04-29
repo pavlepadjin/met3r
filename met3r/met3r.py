@@ -53,21 +53,46 @@ def freeze(m: Module) -> None:
         param.requires_grad = False
     m.eval()
     
+    
+class FeatureUpsampler(Module):
+
+    def __init__(self, upsampler: str = 'featup', feat_backbone: str = 'dinov2'):
+        super().__init__()
+        
+        if upsampler == 'featup':
+            self.upsampler = torch.hub.load(featup_weights, feat_backbone, use_norm=True)
+        elif upsampler == 'loftup':
+            if feat_backbone == 'dinov2':
+                self.upsampler = torch.hub.load('andrehuang/loftup', 'loftup_dinov2s', pretrained=True)
+                self.feature_extractor = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').to('cuda')
+            else:
+                raise ValueError(f"Invalid feat_backbone: {feat_backbone} for loftup")
+            
+        else:
+            raise ValueError(f"Invalid upsampler: {upsampler}")
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.upsampler == 'featup':
+            return self.upsampler(x)
+        elif self.upsampler == 'loftup':
+            lr_feat = self.feature_extractor.get_intermediate_layers(x, reshape=True)[0]
+            return self.upsampler(lr_feat, x)
+        
+    
 
 class MEt3R(Module):
-
-
     def __init__(
         self, 
         img_size: int | None = None, 
         use_norm: bool = True,
-        feat_backbone: str = 'dino16',
+        feat_backbone: str = 'dinov2',
         patch_size: int = 16,
         featup_weights: str | Path = 'mhamilton723/FeatUp',
         dust3r_weights: str | Path = 'naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric',
         use_mast3r_dust3r: bool = True,
         use_mast3r_features: bool = False,
-        use_featup: bool = True,
+        use_feature_upsampler: bool = True,
+        feature_upsampler: str = 'loftup',
         use_dust3r_features: bool = False,
         use_depth_pointmaps: bool = True,
         **kwargs
@@ -85,12 +110,20 @@ class MEt3R(Module):
         """
         super().__init__()
         self.img_size = img_size
-        self.upsampler = torch.hub.load(featup_weights, feat_backbone, use_norm=use_norm)
-        self.patch_size = patch_size
+        # PAVLE
+        #self.upsampler = torch.hub.load(featup_weights, feat_backbone, use_norm=use_norm)
+        # PAVLE
+        #self.patch_size = patch_size
+        self.patch_size = 14
         self.use_mast3r_dust3r = use_mast3r_dust3r
         self.use_mast3r_features = use_mast3r_features
         self.use_dust3r_features = use_dust3r_features
-        self.use_featup = use_featup
+        self.use_feature_upsampler = use_feature_upsampler
+        if use_feature_upsampler:
+            self.upsampler = FeatureUpsampler(upsampler=feature_upsampler, feat_backbone=feat_backbone)
+        else:
+            self.upsampler = None
+            
         if not use_depth_pointmaps:
             if use_mast3r_dust3r:
                 # Load MASt3R
@@ -279,7 +312,7 @@ class MEt3R(Module):
         """
         if use_rgb_as_features:
             hr_feat = images.reshape(2, 3, -1).permute(0, 2, 1)
-        elif self.use_featup:
+        elif self.use_feature_upsampler:
             orig_img_h, orig_img_w = images.shape[-2:]
             if pad:
                 # Calculate padding needed to make dimensions divisible by patch_size
@@ -289,7 +322,8 @@ class MEt3R(Module):
                 images = F.pad(images, (0, pad_w, 0, pad_h), "constant", 0)
             
             with torch.autocast('cuda', enabled=enable_mixed_precision):
-                hr_feat = self.upsampler(norm(images))
+                # PAVLE
+                hr_feat = self.upsampler(images)
                 if pad:
                     hr_feat = hr_feat[..., :orig_img_h, :orig_img_w]
                 hr_feat = torch.nn.functional.interpolate(hr_feat, (orig_img_h, orig_img_w), mode='bilinear')
