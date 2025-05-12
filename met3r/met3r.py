@@ -1,6 +1,3 @@
-# import os
-# os.environ['TORCH_HOME'] = '/BS/grl-masim-data/work/torch_models'
-
 import torch
 from torch import Tensor
 from pathlib import Path
@@ -12,12 +9,9 @@ from einops import rearrange, repeat
 # Load featup
 from featup.util import norm, unnorm
 
-from yugo.python.lib.py_utils.point_cloud import PointCloud
-
 # Load Pytorch3D
 from pytorch3d.structures import Pointclouds
 from pytorch3d.renderer import (
-    FoVPerspectiveCameras, 
     PerspectiveCameras,
     PointsRasterizationSettings,
     PointsRenderer,
