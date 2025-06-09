@@ -10,6 +10,9 @@
 
 ### `TL;DR: A differentiable metric to measure multi-view consistency between an image pair`. 
 
+## Note:
+This repo is a fork of the original Met3r repo (https://github.com/mohammadasim98/met3r) and enables the replacement of the Dust3r transformer with depth maps, poses and calibrations, suitable for the Gaussian Splatting training. This leads to higher quality results and performance. This is done as the part of the work "Gaussian Splatting Regularization for Improved Out-of-Distribution View Synthesis" which can be found here: https://github.com/ppadjin/ood-gaussian-splatting.
+
 ## 🔍 Method Overview 
 <div align="center">
   <img src="assets/method_overview.jpg" width="800"/>
